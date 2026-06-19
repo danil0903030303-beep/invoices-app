@@ -69,21 +69,21 @@ def number_to_words_uah(amount):
         currency = "гривень"
 
     res = " ".join(words).strip()
-    # Робимо першу букву великою, прибираємо зайві пробіли
     res = re.sub(' +', ' ', res).capitalize()
     return f"{res} {kop:02d} копійок"
 
 
-# Автоматичне завантаження шрифту
+# Автоматичне завантаження шрифтів (додав жирний шрифт для уникнення помилки)
 @st.cache_resource
-def get_font():
-    font_path = "Roboto-Regular.ttf"
-    if not os.path.exists(font_path):
-        url = "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf"
-        urllib.request.urlretrieve(url, font_path)
-    return font_path
+def get_fonts():
+    reg_path = "Roboto-Regular.ttf"
+    bold_path = "Roboto-Bold.ttf"
+    if not os.path.exists(reg_path):
+        urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf", reg_path)
+    if not os.path.exists(bold_path):
+        urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
+    return reg_path, bold_path
 
-# Завантаження файлів
 uploaded_files = st.file_uploader("Перетягніть PDF-рахунки сюди", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
@@ -91,17 +91,14 @@ if uploaded_files:
         all_items = []
         
         for file in uploaded_files:
-            # Витягуємо номер рахунку з назви файлу (беремо лише цифри)
             invoice_num = re.sub(r'\D', '', file.name)
             if not invoice_num:
-                invoice_num = file.name.split('.')[0] # Якщо цифр немає, беремо назву цілком
+                invoice_num = file.name.split('.')[0]
 
             with pdfplumber.open(file) as pdf_file:
                 for page in pdf_file.pages:
-                    # Стандартна спроба витягнути таблицю
                     table = page.extract_table()
                     
-                    # Запасний план для рахунків без чітких ліній (як ваш 433947.pdf)
                     if not table:
                         table = page.extract_table(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
                     
@@ -109,7 +106,6 @@ if uploaded_files:
                         for row in table:
                             clean_row = [str(cell).strip() if cell is not None else "" for cell in row]
                             
-                            # Перевіряємо, чи це товар (перша колонка - число)
                             if len(clean_row) >= 5 and clean_row[0].replace('.', '').isdigit():
                                 article = clean_row[1]
                                 item_name = clean_row[2]
@@ -137,7 +133,6 @@ if uploaded_files:
         if all_items:
             df = pd.DataFrame(all_items)
             
-            # Зводимо дані. Якщо товар у кількох рахунках, номери рахунків об'єднаються через кому
             summary_df = df.groupby(["Артикул", "Товар"], as_index=False).agg({
                 "Рахунок": lambda x: ", ".join(sorted(set(str(v) for v in x if v))),
                 "Кількість": "sum",
@@ -148,10 +143,12 @@ if uploaded_files:
             # --- ГЕНЕРАЦІЯ PDF ---
             pdf = FPDF()
             pdf.add_page()
-            font_path = get_font()
-            pdf.add_font("Roboto", "", font_path, uni=True)
             
-            # Заголовок
+            # Завантажуємо обидва шрифти
+            font_reg, font_bold = get_fonts()
+            pdf.add_font("Roboto", "", font_reg, uni=True)
+            pdf.add_font("Roboto", "B", font_bold, uni=True)
+            
             pdf.set_font("Roboto", size=14)
             months = {"January": "січня", "February": "лютого", "March": "березня", "April": "квітня", "May": "травня", "June": "червня", "July": "липня", "August": "серпня", "September": "вересня", "October": "жовтня", "November": "листопада", "December": "грудня"}
             current_date_eng = datetime.now().strftime("%d %B %Y")
@@ -161,7 +158,6 @@ if uploaded_files:
             pdf.cell(0, 10, txt=f"Видаткова накладна № ЗВЕДЕНА від {current_date_eng} р.", ln=True, align='L')
             pdf.ln(5)
             
-            # Реквізити
             pdf.set_font("Roboto", size=10)
             x = pdf.get_x()
             y = pdf.get_y()
@@ -183,18 +179,16 @@ if uploaded_files:
             pdf.multi_cell(0, 6, txt="ТОВ Технології Поля", border=0)
             pdf.ln(8)
             
-            # Шапка таблиці (оновлені ширини під нову колонку)
             col_widths = [10, 18, 18, 84, 20, 20, 20]
             headers = ["№", "Артикул", "Рахунок", "Товар", "Кількість", "Ціна", "Сума"]
             for i in range(len(headers)):
                 pdf.cell(col_widths[i], 8, txt=headers[i], border=1, align='C')
             pdf.ln()
             
-            # Наповнення таблиці
             total_invoice_sum = 0
             for idx, row in summary_df.iterrows():
                 item_name = str(row['Товар'])
-                wrapped_name = textwrap.fill(item_name, width=42) # Трохи зменшили ширину тексту під колонку
+                wrapped_name = textwrap.fill(item_name, width=42)
                 lines_count = len(wrapped_name.split('\n'))
                 
                 line_height_for_multi = 6
@@ -209,8 +203,6 @@ if uploaded_files:
                 
                 pdf.cell(col_widths[0], row_height, txt=str(idx+1), border=1, align='C')
                 pdf.cell(col_widths[1], row_height, txt=str(row['Артикул']), border=1, align='C')
-                
-                # Колонка Рахунок
                 pdf.cell(col_widths[2], row_height, txt=str(row['Рахунок']), border=1, align='C')
                 
                 x_after_account = pdf.get_x()
@@ -227,12 +219,11 @@ if uploaded_files:
             
             pdf.ln(5)
             
-            # Підсумок "Разом"
-            pdf.set_font("Roboto", size=11, style='B') # Жирний шрифт для підсумку
+            # Використовуємо стиль 'B' - тепер він запрацює
+            pdf.set_font("Roboto", size=11, style='B') 
             pdf.cell(0, 8, txt=f"Разом: {total_invoice_sum:.2f}", ln=True, align='R')
             pdf.ln(2)
             
-            # Всього найменувань і сума прописом
             pdf.set_font("Roboto", size=10)
             pdf.cell(0, 6, txt=f"Всього найменувань {len(summary_df)}, на суму {total_invoice_sum:.2f} грн", ln=True, align='L')
             
@@ -241,7 +232,6 @@ if uploaded_files:
             pdf.cell(0, 6, txt=sum_words, ln=True, align='L')
             pdf.ln(15)
             
-            # Підписи
             pdf.set_font("Roboto", size=10, style='B')
             x_sig = pdf.get_x()
             y_sig = pdf.get_y()
