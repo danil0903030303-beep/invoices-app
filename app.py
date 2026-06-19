@@ -286,7 +286,7 @@ if uploaded_files:
             for eng, ukr in months.items():
                 current_date_eng = current_date_eng.replace(eng, ukr)
             
-            pdf.cell(0, 10, txt=f"Видаткова накладна № ЗВЕДЕНА від {current_date_eng} р.", ln=True, align='L')
+            pdf.cell(0, 10, txt=f"Видаткова накладна згідно рахунків від {current_date_eng} р.", ln=True, align='L')
             pdf.ln(5)
             
             pdf.set_font("Roboto", size=10)
