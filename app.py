@@ -85,35 +85,90 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
+# --- НОВИЙ РОЗУМНИЙ ПАРСЕР ---
 def parse_extracted_text(text, invoice_num):
     items = []
-    # Патерн: шукає числа (цілі або з копійками) у кінці рядка, ігноруючи сміття
-    number_pattern = r'(\d+[,.]\d{1,2}|\d+)'
-    pattern = rf'^.*?(\d{{1,4}})\s+([A-Za-z0-9/-]+)\s+(.+?)\s+{number_pattern}\s*([а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+{number_pattern}\s+{number_pattern}\s*$'
+    UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.'}
     
     for line in text.split('\n'):
+        # Очищення від сміття OCR
         line = line.replace('|', ' ').replace('_', ' ').strip()
         line = re.sub(r'\s+', ' ', line)
         
-        match = re.search(pattern, line)
+        if "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
+            continue
+
+        # Шукаємо: [Опціональний №] [Артикул] [Назва та числа]
+        match = re.search(r'^(?:\d{1,4}\s+)?([A-Za-z0-9/-]{3,})\s+(.+)$', line)
         if match:
-            try:
-                qty = float(match.group(4).replace(',', '.'))
-                price = float(match.group(6).replace(',', '.'))
-                total = float(match.group(7).replace(',', '.'))
+            art = match.group(1)
+            rest = match.group(2)
+            
+            tokens = rest.split()
+            numbers = []
+            processed_count = 0
+            
+            # Читаємо рядок з кінця до початку
+            for token in reversed(tokens):
+                token_fixed = token.replace('O', '0').replace('o', '0')
+                token_fixed = token_fixed.replace('грн', '').replace('₴', '')
                 
-                # Запобіжник від випадкового захоплення "Разом"
-                if qty > 0 and price > 0 and total > 0 and "разом" not in match.group(3).lower():
+                # Якщо токен "злипся" з одиницею (напр. "2шт")
+                match_glued = re.match(r'^([\d.,]+)(шт|кг|л|м|уп)\.?$', token_fixed.lower())
+                if match_glued:
+                    try:
+                        val = float(match_glued.group(1).replace(',', '.'))
+                        numbers.append(val)
+                        processed_count += 1
+                        continue
+                    except:
+                        pass
+                
+                # Якщо це просто число
+                if re.match(r'^[\d.,]+$', token_fixed) and any(c.isdigit() for c in token_fixed):
+                    try:
+                        val = float(token_fixed.replace(',', '.'))
+                        numbers.append(val)
+                        processed_count += 1
+                        continue
+                    except:
+                        pass
+                
+                # Якщо це одиниця виміру (ігноруємо її, йдемо далі)
+                if token.lower() in UNITS:
+                    processed_count += 1
+                    continue
+                    
+                # Якщо ми дійшли до тексту, а в нас вже є 2 числа (Ціна і Сума) - зупиняємось
+                if len(numbers) >= 2:
+                    break
+                else:
+                    # Якщо тексту багато, а чисел в кінці не було - це не товар
+                    break
+                    
+            if len(numbers) >= 2:
+                total = numbers[0]
+                price = numbers[1]
+                
+                # МАГІЯ: Якщо сканер не побачив кількість, вираховуємо її самі!
+                if len(numbers) >= 3:
+                    qty = numbers[2]
+                else:
+                    qty = round(total / price, 2) if price else 1.0
+                
+                # Назва товару - це все, що ми не обробили з кінця
+                name_tokens = tokens[:-processed_count] if processed_count > 0 else tokens
+                name = " ".join(name_tokens).strip()
+                
+                if name and price > 0 and total > 0:
                     items.append({
-                        "Артикул": match.group(2),
+                        "Артикул": art,
                         "Рахунок": invoice_num,
-                        "Товар": match.group(3).strip(),
+                        "Товар": name,
                         "Кількість": qty,
                         "Ціна": price,
                         "Сума": total
                     })
-            except Exception:
-                pass
     return items
 
 uploaded_files = st.file_uploader("Перетягніть PDF-рахунки сюди", type="pdf", accept_multiple_files=True)
@@ -121,7 +176,7 @@ uploaded_files = st.file_uploader("Перетягніть PDF-рахунки с�
 if uploaded_files:
     if st.button("Сформувати 1 видаткову"):
         all_items = []
-        debug_logs = {} # Словник для збереження сирого тексту для діагностики
+        debug_logs = {}
         
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -182,12 +237,10 @@ if uploaded_files:
                     if not page_items:
                         status_text.text(f"Файл {file.name} - це фотографія. Запускаю OCR сканер...")
                         try:
-                            # Генеруємо картинку прямо через pdfplumber (без pdf2image/poppler!)
                             img = page.to_image(resolution=300).original
                             try:
                                 ocr_text = pytesseract.image_to_string(img, lang='ukr')
                             except Exception:
-                                # Якщо української мови немає, пробуємо стандартну англійську (для цифр підійде)
                                 ocr_text = pytesseract.image_to_string(img)
                                 
                             extracted_raw_text += "--- ТЕКСТ З OCR СКАНЕРА ---\n" + ocr_text + "\n"
@@ -328,10 +381,8 @@ if uploaded_files:
         else:
             st.warning("Не вдалося розпізнати товари. Перевірте формат рахунків.")
             
-            # БЛОК ДІАГНОСТИКИ
             st.markdown("---")
             st.write("🛠 **Діагностика (для пошуку помилок)**")
-            st.write("Якщо рахунок не розпізнався, розгорніть панель нижче, щоб побачити, як програма 'прочитала' ваш файл. Ви можете скинути цей текст мені.")
             for filename, raw_text in debug_logs.items():
                 if raw_text.strip():
                     with st.expander(f"Сирий текст з файлу {filename}"):
