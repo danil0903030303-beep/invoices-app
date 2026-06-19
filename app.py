@@ -8,6 +8,8 @@ import urllib.request
 from fpdf import FPDF
 from datetime import datetime
 import textwrap
+from pdf2image import convert_from_bytes
+import pytesseract
 
 st.title("Генератор зведеної видаткової (PDF)")
 
@@ -72,7 +74,6 @@ def number_to_words_uah(amount):
     res = re.sub(' +', ' ', res).capitalize()
     return f"{res} {kop:02d} копійок"
 
-
 # Автоматичне завантаження шрифтів
 @st.cache_resource
 def get_fonts():
@@ -90,24 +91,28 @@ if uploaded_files:
     if st.button("Сформувати 1 видаткову"):
         all_items = []
         
-        for file in uploaded_files:
+        # Візуальні елементи для індикації процесу
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, file in enumerate(uploaded_files):
+            status_text.text(f"Аналіз файлу: {file.name}...")
+            file_bytes = file.read()
             invoice_num = re.sub(r'\D', '', file.name)
             if not invoice_num:
                 invoice_num = file.name.split('.')[0]
 
-            with pdfplumber.open(file) as pdf_file:
+            page_items = []
+
+            # МЕТОД 1 та 2: Звичайне читання (якщо файл має текстовий шар)
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf_file:
                 for page in pdf_file.pages:
-                    page_items = []
-                    
-                    # МЕТОД 1: Читання таблиці (для гарно відформатованих рахунків)
                     strategies = [
-                        None, 
                         {"vertical_strategy": "text", "horizontal_strategy": "lines"},
                         {"vertical_strategy": "text", "horizontal_strategy": "text"}
                     ]
-                    
                     for strategy in strategies:
-                        table = page.extract_table(table_settings=strategy) if strategy else page.extract_table()
+                        table = page.extract_table(table_settings=strategy)
                         if table:
                             for row in table:
                                 solid_cells = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
@@ -135,36 +140,60 @@ if uploaded_files:
                                         })
                                     except Exception:
                                         pass
-                        
-                        if page_items:
-                            break # Якщо метод знайшов товари, перериваємо пошук таблиць
+                        if page_items: break
                     
-                    # МЕТОД 2 (УЛЬТИМАТИВНИЙ): Якщо таблиці немає, читаємо сирий текст порядково
                     if not page_items:
                         text = page.extract_text()
                         if text:
                             for line in text.split('\n'):
-                                line = re.sub(r'\s+', ' ', line.strip()) # Прибираємо зайві пробіли
-                                
-                                # Шукаємо: № Артикул Товар Кількість [Одиниці] Ціна Сума
+                                line = re.sub(r'\s+', ' ', line.strip())
                                 pattern = r'^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s*(?:[а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+([\d.,]+)\s+([\d.,]+)$'
                                 match = re.search(pattern, line)
-                                
                                 if match:
                                     try:
                                         page_items.append({
-                                            "Артикул": match.group(2),
-                                            "Рахунок": invoice_num,
-                                            "Товар": match.group(3).strip(),
-                                            "Кількість": float(match.group(4).replace(',', '.')),
-                                            "Ціна": float(match.group(5).replace(',', '.')),
-                                            "Сума": float(match.group(6).replace(',', '.'))
+                                            "Артикул": match.group(2), "Рахунок": invoice_num, "Товар": match.group(3).strip(),
+                                            "Кількість": float(match.group(4).replace(',', '.')), "Ціна": float(match.group(5).replace(',', '.')), "Сума": float(match.group(6).replace(',', '.'))
                                         })
                                     except Exception:
                                         pass
-                    
-                    if page_items:
-                        all_items.extend(page_items)
+
+            # МЕТОД 3: ОПТИЧНЕ РОЗПІЗНАВАННЯ (OCR) - Якщо це фото-PDF
+            if not page_items:
+                status_text.text(f"Файл {file.name} виглядає як фотографія. Вмикаю розумний сканер OCR... Зачекайте.")
+                try:
+                    images = convert_from_bytes(file_bytes)
+                    for img in images:
+                        ocr_text = pytesseract.image_to_string(img, lang='ukr')
+                        for line in ocr_text.split('\n'):
+                            line = re.sub(r'\s+', ' ', line.strip())
+                            pattern = r'^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s*(?:[а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+([\d.,]+)\s+([\d.,]+)$'
+                            match = re.search(pattern, line)
+                            if match:
+                                try:
+                                    # Виправляємо типові помилки сканера (наприклад, коли він бачить літеру 'O' замість нуля)
+                                    qty_str = match.group(4).replace(',', '.').replace('O', '0').replace('o', '0')
+                                    price_str = match.group(5).replace(',', '.').replace('O', '0').replace('o', '0')
+                                    sum_str = match.group(6).replace(',', '.').replace('O', '0').replace('o', '0')
+                                    
+                                    page_items.append({
+                                        "Артикул": match.group(2), "Рахунок": invoice_num, "Товар": match.group(3).strip(),
+                                        "Кількість": float(qty_str), "Ціна": float(price_str), "Сума": float(sum_str)
+                                    })
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    pass
+            
+            if page_items:
+                all_items.extend(page_items)
+            
+            # Оновлюємо прогрес після кожного файлу
+            progress = (i + 1) / len(uploaded_files)
+            progress_bar.progress(progress)
+
+        status_text.empty() # Ховаємо текст після завершення
+        progress_bar.empty()
 
         if all_items:
             df = pd.DataFrame(all_items)
