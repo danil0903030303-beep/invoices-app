@@ -73,7 +73,7 @@ def number_to_words_uah(amount):
     return f"{res} {kop:02d} копійок"
 
 
-# Автоматичне завантаження шрифтів (додав жирний шрифт для уникнення помилки)
+# Автоматичне завантаження шрифтів
 @st.cache_resource
 def get_fonts():
     reg_path = "Roboto-Regular.ttf"
@@ -97,38 +97,57 @@ if uploaded_files:
 
             with pdfplumber.open(file) as pdf_file:
                 for page in pdf_file.pages:
-                    table = page.extract_table()
+                    # 3 різні стратегії розпізнавання (від найсуворішої до найгнучкішої)
+                    strategies = [
+                        None, 
+                        {"vertical_strategy": "text", "horizontal_strategy": "text"},
+                        {"vertical_strategy": "lines", "horizontal_strategy": "text"}
+                    ]
                     
-                    if not table:
-                        table = page.extract_table(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
-                    
-                    if table:
-                        for row in table:
-                            clean_row = [str(cell).strip() if cell is not None else "" for cell in row]
-                            
-                            if len(clean_row) >= 5 and clean_row[0].replace('.', '').isdigit():
-                                article = clean_row[1]
-                                item_name = clean_row[2]
+                    page_items = []
+                    for strategy in strategies:
+                        table = page.extract_table(table_settings=strategy) if strategy else page.extract_table()
+                        
+                        if table:
+                            for row in table:
+                                # Беремо лише клітинки, де є текст (ігноруємо фантомні порожні стовпці)
+                                solid_cells = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
                                 
-                                sum_str = clean_row[-1]
-                                price_str = clean_row[-2]
-                                qty_str = clean_row[3] 
-                                
-                                try:
-                                    qty = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
-                                    price = float(re.sub(r'[^\d.,]', '', price_str).replace(',', '.'))
-                                    total_sum = float(re.sub(r'[^\d.,]', '', sum_str).replace(',', '.'))
-                                    
-                                    all_items.append({
-                                        "Артикул": article,
-                                        "Рахунок": invoice_num,
-                                        "Товар": item_name,
-                                        "Кількість": qty,
-                                        "Ціна": price,
-                                        "Сума": total_sum
-                                    })
-                                except ValueError:
-                                    continue
+                                # Перевіряємо, чи є в рядку хоча б 5 колонок і перша з них - цифра (№)
+                                if len(solid_cells) >= 5 and solid_cells[0].replace('.', '').isdigit():
+                                    try:
+                                        # Читаємо рядок з кінця: Сума завжди остання, Ціна - передостання
+                                        sum_val = float(re.sub(r'[^\d.,]', '', solid_cells[-1]).replace(',', '.'))
+                                        price_val = float(re.sub(r'[^\d.,]', '', solid_cells[-2]).replace(',', '.'))
+                                        
+                                        # Кількість шукаємо перед ціною
+                                        qty_str = solid_cells[-3]
+                                        
+                                        # Якщо в клітинці кількості тільки букви (напр. "шт"), значить цифра ще лівіше
+                                        if not any(char.isdigit() for char in qty_str):
+                                            qty_str = solid_cells[-4]
+                                            item_name = " ".join(solid_cells[2:-4]) # Все інше - це Товар
+                                        else:
+                                            item_name = " ".join(solid_cells[2:-3])
+                                            
+                                        qty_val = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
+                                        article = solid_cells[1]
+                                        
+                                        page_items.append({
+                                            "Артикул": article,
+                                            "Рахунок": invoice_num,
+                                            "Товар": item_name,
+                                            "Кількість": qty_val,
+                                            "Ціна": price_val,
+                                            "Сума": sum_val
+                                        })
+                                    except Exception as e:
+                                        continue
+                        
+                        # Якщо на цій сторінці вдалося знайти товари, припиняємо перебір стратегій
+                        if page_items:
+                            all_items.extend(page_items)
+                            break
 
         if all_items:
             df = pd.DataFrame(all_items)
@@ -144,7 +163,6 @@ if uploaded_files:
             pdf = FPDF()
             pdf.add_page()
             
-            # Завантажуємо обидва шрифти
             font_reg, font_bold = get_fonts()
             pdf.add_font("Roboto", "", font_reg, uni=True)
             pdf.add_font("Roboto", "B", font_bold, uni=True)
@@ -155,7 +173,7 @@ if uploaded_files:
             for eng, ukr in months.items():
                 current_date_eng = current_date_eng.replace(eng, ukr)
             
-            pdf.cell(0, 10, txt=f"Видаткова накладна згідно рахунків від {current_date_eng} р.", ln=True, align='L')
+            pdf.cell(0, 10, txt=f"Видаткова накладна № ЗВЕДЕНА від {current_date_eng} р.", ln=True, align='L')
             pdf.ln(5)
             
             pdf.set_font("Roboto", size=10)
@@ -219,8 +237,7 @@ if uploaded_files:
             
             pdf.ln(5)
             
-            # Використовуємо стиль 'B' - тепер він запрацює
-            pdf.set_font("Roboto", size=11, style='B') 
+            pdf.set_font("Roboto", size=11, style='B')
             pdf.cell(0, 8, txt=f"Разом: {total_invoice_sum:.2f}", ln=True, align='R')
             pdf.ln(2)
             
