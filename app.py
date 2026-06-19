@@ -97,76 +97,74 @@ if uploaded_files:
 
             with pdfplumber.open(file) as pdf_file:
                 for page in pdf_file.pages:
-                    # 3 стратегії: від ідеальних ліній до повної їх відсутності
+                    page_items = []
+                    
+                    # МЕТОД 1: Читання таблиці (для гарно відформатованих рахунків)
                     strategies = [
                         None, 
                         {"vertical_strategy": "text", "horizontal_strategy": "lines"},
                         {"vertical_strategy": "text", "horizontal_strategy": "text"}
                     ]
                     
-                    page_items = []
                     for strategy in strategies:
                         table = page.extract_table(table_settings=strategy) if strategy else page.extract_table()
-                        
                         if table:
                             for row in table:
                                 solid_cells = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
                                 if not solid_cells: continue
                                 
-                                # Перевіряємо, чи починається рядок з цифри (номера по порядку)
                                 first_word = solid_cells[0].split()[0].replace('.', '')
-                                if first_word.isdigit():
-                                    parsed_successfully = False
-                                    
-                                    # Метод 1: Якщо таблиця гарно розбилася на колонки
-                                    if len(solid_cells) >= 5:
-                                        try:
-                                            sum_val = float(re.sub(r'[^\d.,]', '', solid_cells[-1]).replace(',', '.'))
-                                            price_val = float(re.sub(r'[^\d.,]', '', solid_cells[-2]).replace(',', '.'))
-                                            qty_str = solid_cells[-3]
-                                            
-                                            if not any(char.isdigit() for char in qty_str):
-                                                qty_str = solid_cells[-4]
-                                                item_name = " ".join(solid_cells[2:-4])
-                                            else:
-                                                item_name = " ".join(solid_cells[2:-3])
-                                                
-                                            qty_val = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
-                                            article = solid_cells[1]
-                                            
-                                            page_items.append({
-                                                "Артикул": article, "Рахунок": invoice_num, "Товар": item_name,
-                                                "Кількість": qty_val, "Ціна": price_val, "Сума": sum_val
-                                            })
-                                            parsed_successfully = True
-                                        except Exception:
-                                            pass
-                                    
-                                    # Метод 2 (Regex-сканер): Якщо колонки злиплися через відсутність ліній
-                                    if not parsed_successfully:
-                                        row_str = " ".join(solid_cells).replace('\n', ' ').strip()
-                                        row_str = re.sub(' +', ' ', row_str) # Прибираємо зайві пробіли
+                                if first_word.isdigit() and len(solid_cells) >= 5:
+                                    try:
+                                        sum_val = float(re.sub(r'[^\d.,]', '', solid_cells[-1]).replace(',', '.'))
+                                        price_val = float(re.sub(r'[^\d.,]', '', solid_cells[-2]).replace(',', '.'))
                                         
-                                        # Цей патерн шукає: № + Артикул + Товар + К-сть + (Одиниці) + Ціна + Сума
-                                        pattern = r'^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s*(?:[а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+([\d.,]+)\s+([\d.,]+)$'
-                                        match = re.search(pattern, row_str)
-                                        if match:
-                                            try:
-                                                page_items.append({
-                                                    "Артикул": match.group(2),
-                                                    "Рахунок": invoice_num,
-                                                    "Товар": match.group(3).strip(),
-                                                    "Кількість": float(match.group(4).replace(',', '.')),
-                                                    "Ціна": float(match.group(5).replace(',', '.')),
-                                                    "Сума": float(match.group(6).replace(',', '.'))
-                                                })
-                                            except Exception:
-                                                pass
+                                        qty_str = solid_cells[-3]
+                                        if not any(char.isdigit() for char in qty_str):
+                                            qty_str = solid_cells[-4]
+                                            item_name = " ".join(solid_cells[2:-4])
+                                        else:
+                                            item_name = " ".join(solid_cells[2:-3])
+                                            
+                                        qty_val = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
+                                        article = solid_cells[1]
+                                        
+                                        page_items.append({
+                                            "Артикул": article, "Рахунок": invoice_num, "Товар": item_name,
+                                            "Кількість": qty_val, "Ціна": price_val, "Сума": sum_val
+                                        })
+                                    except Exception:
+                                        pass
                         
-                        # Якщо хоча б один товар на сторінці знайдено, переходимо до наступної сторінки
                         if page_items:
-                            all_items.extend(page_items)
-                            break
+                            break # Якщо метод знайшов товари, перериваємо пошук таблиць
+                    
+                    # МЕТОД 2 (УЛЬТИМАТИВНИЙ): Якщо таблиці немає, читаємо сирий текст порядково
+                    if not page_items:
+                        text = page.extract_text()
+                        if text:
+                            for line in text.split('\n'):
+                                line = re.sub(r'\s+', ' ', line.strip()) # Прибираємо зайві пробіли
+                                
+                                # Шукаємо: № Артикул Товар Кількість [Одиниці] Ціна Сума
+                                pattern = r'^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s*(?:[а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+([\d.,]+)\s+([\d.,]+)$'
+                                match = re.search(pattern, line)
+                                
+                                if match:
+                                    try:
+                                        page_items.append({
+                                            "Артикул": match.group(2),
+                                            "Рахунок": invoice_num,
+                                            "Товар": match.group(3).strip(),
+                                            "Кількість": float(match.group(4).replace(',', '.')),
+                                            "Ціна": float(match.group(5).replace(',', '.')),
+                                            "Сума": float(match.group(6).replace(',', '.'))
+                                        })
+                                    except Exception:
+                                        pass
+                    
+                    if page_items:
+                        all_items.extend(page_items)
 
         if all_items:
             df = pd.DataFrame(all_items)
