@@ -8,9 +8,9 @@ import urllib.request
 from fpdf import FPDF
 from datetime import datetime
 import textwrap
-from pdf2image import convert_from_bytes
 import pytesseract
 
+st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
 
 # --- ФУНКЦІЯ ДЛЯ СУМИ ПРОПИСОМ ---
@@ -85,13 +85,44 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
+def parse_extracted_text(text, invoice_num):
+    items = []
+    # Патерн: шукає числа (цілі або з копійками) у кінці рядка, ігноруючи сміття
+    number_pattern = r'(\d+[,.]\d{1,2}|\d+)'
+    pattern = rf'^.*?(\d{{1,4}})\s+([A-Za-z0-9/-]+)\s+(.+?)\s+{number_pattern}\s*([а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+{number_pattern}\s+{number_pattern}\s*$'
+    
+    for line in text.split('\n'):
+        line = line.replace('|', ' ').replace('_', ' ').strip()
+        line = re.sub(r'\s+', ' ', line)
+        
+        match = re.search(pattern, line)
+        if match:
+            try:
+                qty = float(match.group(4).replace(',', '.'))
+                price = float(match.group(6).replace(',', '.'))
+                total = float(match.group(7).replace(',', '.'))
+                
+                # Запобіжник від випадкового захоплення "Разом"
+                if qty > 0 and price > 0 and total > 0 and "разом" not in match.group(3).lower():
+                    items.append({
+                        "Артикул": match.group(2),
+                        "Рахунок": invoice_num,
+                        "Товар": match.group(3).strip(),
+                        "Кількість": qty,
+                        "Ціна": price,
+                        "Сума": total
+                    })
+            except Exception:
+                pass
+    return items
+
 uploaded_files = st.file_uploader("Перетягніть PDF-рахунки сюди", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
     if st.button("Сформувати 1 видаткову"):
         all_items = []
+        debug_logs = {} # Словник для збереження сирого тексту для діагностики
         
-        # Візуальні елементи для індикації процесу
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -103,96 +134,79 @@ if uploaded_files:
                 invoice_num = file.name.split('.')[0]
 
             page_items = []
+            extracted_raw_text = ""
 
-            # МЕТОД 1 та 2: Звичайне читання (якщо файл має текстовий шар)
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf_file:
                 for page in pdf_file.pages:
-                    strategies = [
-                        {"vertical_strategy": "text", "horizontal_strategy": "lines"},
-                        {"vertical_strategy": "text", "horizontal_strategy": "text"}
-                    ]
-                    for strategy in strategies:
-                        table = page.extract_table(table_settings=strategy)
-                        if table:
-                            for row in table:
-                                solid_cells = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
-                                if not solid_cells: continue
-                                
-                                first_word = solid_cells[0].split()[0].replace('.', '')
-                                if first_word.isdigit() and len(solid_cells) >= 5:
-                                    try:
-                                        sum_val = float(re.sub(r'[^\d.,]', '', solid_cells[-1]).replace(',', '.'))
-                                        price_val = float(re.sub(r'[^\d.,]', '', solid_cells[-2]).replace(',', '.'))
-                                        
-                                        qty_str = solid_cells[-3]
-                                        if not any(char.isdigit() for char in qty_str):
-                                            qty_str = solid_cells[-4]
-                                            item_name = " ".join(solid_cells[2:-4])
-                                        else:
-                                            item_name = " ".join(solid_cells[2:-3])
-                                            
-                                        qty_val = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
-                                        article = solid_cells[1]
-                                        
-                                        page_items.append({
-                                            "Артикул": article, "Рахунок": invoice_num, "Товар": item_name,
-                                            "Кількість": qty_val, "Ціна": price_val, "Сума": sum_val
-                                        })
-                                    except Exception:
-                                        pass
-                        if page_items: break
-                    
-                    if not page_items:
-                        text = page.extract_text()
-                        if text:
-                            for line in text.split('\n'):
-                                line = re.sub(r'\s+', ' ', line.strip())
-                                pattern = r'^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s*(?:[а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+([\d.,]+)\s+([\d.,]+)$'
-                                match = re.search(pattern, line)
-                                if match:
-                                    try:
-                                        page_items.append({
-                                            "Артикул": match.group(2), "Рахунок": invoice_num, "Товар": match.group(3).strip(),
-                                            "Кількість": float(match.group(4).replace(',', '.')), "Ціна": float(match.group(5).replace(',', '.')), "Сума": float(match.group(6).replace(',', '.'))
-                                        })
-                                    except Exception:
-                                        pass
-
-            # МЕТОД 3: ОПТИЧНЕ РОЗПІЗНАВАННЯ (OCR) - Якщо це фото-PDF
-            if not page_items:
-                status_text.text(f"Файл {file.name} виглядає як фотографія. Вмикаю розумний сканер OCR... Зачекайте.")
-                try:
-                    images = convert_from_bytes(file_bytes)
-                    for img in images:
-                        ocr_text = pytesseract.image_to_string(img, lang='ukr')
-                        for line in ocr_text.split('\n'):
-                            line = re.sub(r'\s+', ' ', line.strip())
-                            pattern = r'^(\d+)\s+(\S+)\s+(.+?)\s+([\d.,]+)\s*(?:[а-яА-ЯіІїЇєЄa-zA-Z.]+)?\s+([\d.,]+)\s+([\d.,]+)$'
-                            match = re.search(pattern, line)
-                            if match:
+                    # МЕТОД 1: Читання таблиці
+                    table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
+                    if not table:
+                        table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "text"})
+                        
+                    if table:
+                        for row in table:
+                            solid_cells = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
+                            if not solid_cells: continue
+                            
+                            first_word = solid_cells[0].split()[0].replace('.', '')
+                            if first_word.isdigit() and len(solid_cells) >= 5:
                                 try:
-                                    # Виправляємо типові помилки сканера (наприклад, коли він бачить літеру 'O' замість нуля)
-                                    qty_str = match.group(4).replace(',', '.').replace('O', '0').replace('o', '0')
-                                    price_str = match.group(5).replace(',', '.').replace('O', '0').replace('o', '0')
-                                    sum_str = match.group(6).replace(',', '.').replace('O', '0').replace('o', '0')
+                                    sum_val = float(re.sub(r'[^\d.,]', '', solid_cells[-1]).replace(',', '.'))
+                                    price_val = float(re.sub(r'[^\d.,]', '', solid_cells[-2]).replace(',', '.'))
+                                    
+                                    qty_str = solid_cells[-3]
+                                    if not any(char.isdigit() for char in qty_str):
+                                        qty_str = solid_cells[-4]
+                                        item_name = " ".join(solid_cells[2:-4])
+                                    else:
+                                        item_name = " ".join(solid_cells[2:-3])
+                                        
+                                    qty_val = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
+                                    article = solid_cells[1]
                                     
                                     page_items.append({
-                                        "Артикул": match.group(2), "Рахунок": invoice_num, "Товар": match.group(3).strip(),
-                                        "Кількість": float(qty_str), "Ціна": float(price_str), "Сума": float(sum_str)
+                                        "Артикул": article, "Рахунок": invoice_num, "Товар": item_name,
+                                        "Кількість": qty_val, "Ціна": price_val, "Сума": sum_val
                                     })
                                 except Exception:
                                     pass
-                except Exception as e:
-                    pass
+                    
+                    # МЕТОД 2: Читання тексту (якщо таблиця не вийшла)
+                    if not page_items:
+                        text = page.extract_text()
+                        if text:
+                            extracted_raw_text += text + "\n"
+                            page_items.extend(parse_extracted_text(text, invoice_num))
+
+                    # МЕТОД 3: OCR (якщо сторінка - це просто фотографія без тексту)
+                    if not page_items:
+                        status_text.text(f"Файл {file.name} - це фотографія. Запускаю OCR сканер...")
+                        try:
+                            # Генеруємо картинку прямо через pdfplumber (без pdf2image/poppler!)
+                            img = page.to_image(resolution=300).original
+                            try:
+                                ocr_text = pytesseract.image_to_string(img, lang='ukr')
+                            except Exception:
+                                # Якщо української мови немає, пробуємо стандартну англійську (для цифр підійде)
+                                ocr_text = pytesseract.image_to_string(img)
+                                
+                            extracted_raw_text += "--- ТЕКСТ З OCR СКАНЕРА ---\n" + ocr_text + "\n"
+                            page_items.extend(parse_extracted_text(ocr_text, invoice_num))
+                            
+                        except pytesseract.TesseractNotFoundError:
+                            st.error(f"❌ Системна помилка: Сервер не знайшов OCR сканер. Переконайтеся, що файл packages.txt містить tesseract-ocr і ви зробили Reboot app у налаштуваннях Streamlit.")
+                        except Exception as e:
+                            st.error(f"❌ Помилка при скануванні фотографії {file.name}: {str(e)}")
+            
+            debug_logs[file.name] = extracted_raw_text
             
             if page_items:
                 all_items.extend(page_items)
             
-            # Оновлюємо прогрес після кожного файлу
             progress = (i + 1) / len(uploaded_files)
             progress_bar.progress(progress)
 
-        status_text.empty() # Ховаємо текст після завершення
+        status_text.empty()
         progress_bar.empty()
 
         if all_items:
@@ -304,8 +318,7 @@ if uploaded_files:
             
             pdf_bytes = bytes(pdf.output())
             
-            st.success("PDF-накладну успішно згенеровано!")
-            
+            st.success("✅ PDF-накладну успішно згенеровано!")
             st.download_button(
                 label="Завантажити видаткову (PDF)",
                 data=pdf_bytes,
@@ -314,3 +327,12 @@ if uploaded_files:
             )
         else:
             st.warning("Не вдалося розпізнати товари. Перевірте формат рахунків.")
+            
+            # БЛОК ДІАГНОСТИКИ
+            st.markdown("---")
+            st.write("🛠 **Діагностика (для пошуку помилок)**")
+            st.write("Якщо рахунок не розпізнався, розгорніть панель нижче, щоб побачити, як програма 'прочитала' ваш файл. Ви можете скинути цей текст мені.")
+            for filename, raw_text in debug_logs.items():
+                if raw_text.strip():
+                    with st.expander(f"Сирий текст з файлу {filename}"):
+                        st.text(raw_text)
