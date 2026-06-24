@@ -85,10 +85,10 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-# --- НОВИЙ РОЗУМНИЙ ПАРСЕР ---
+# --- НОВИЙ МАТЕМАТИЧНИЙ ПАРСЕР ---
 def parse_extracted_text(text, invoice_num):
     items = []
-    UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.'}
+    UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
     
     for line in text.split('\n'):
         line = line.replace('|', ' ').replace('_', ' ').strip()
@@ -97,68 +97,81 @@ def parse_extracted_text(text, invoice_num):
         if "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
             continue
 
-        match = re.search(r'^(?:\d{1,4}\s+)?([A-Za-z0-9/-]{3,})\s+(.+)$', line)
-        if match:
-            art = match.group(1)
-            rest = match.group(2)
+        art = ""
+        rest = line
+        
+        # Видаляємо порядковий номер на початку, якщо він є
+        match_idx = re.match(r'^(\d{1,4})\s+(.+)$', rest)
+        if match_idx:
+            rest = match_idx.group(2)
+        
+        # Шукаємо Артикул (будь-які букви/цифри/дефіси, але ОБОВ'ЯЗКОВО має бути хоч одна цифра)
+        match_art = re.match(r'^([A-Za-zА-Яа-яІіЇїЄє0-9/-]*\d[A-Za-zА-Яа-яІіЇїЄє0-9/-]*)\s+(.+)$', rest)
+        if match_art:
+            art = match_art.group(1)
+            rest = match_art.group(2)
             
-            tokens = rest.split()
-            numbers = []
-            processed_count = 0
+        tokens = rest.split()
+        if len(tokens) < 3:
+            continue
             
-            for token in reversed(tokens):
-                token_fixed = token.replace('O', '0').replace('o', '0')
-                token_fixed = token_fixed.replace('грн', '').replace('₴', '')
-                
-                match_glued = re.match(r'^([\d.,]+)(шт|кг|л|м|уп)\.?$', token_fixed.lower())
+        # Завжди беремо два останні числа як Ціну та Суму
+        try:
+            total = float(tokens[-1].replace(',', '.').replace('O', '0'))
+            price = float(tokens[-2].replace(',', '.').replace('O', '0'))
+        except ValueError:
+            continue
+            
+        if price <= 0 or total <= 0:
+            continue
+            
+        # Вираховуємо кількість математично
+        math_qty = round(total / price, 2)
+        qty = math_qty
+        
+        # Все, що залишилося - це назва товару (плюс, можливо, розпізнана кількість)
+        name_tokens = tokens[:-2]
+        
+        # Обережно відрізаємо кількість та одиниці виміру з кінця назви, якщо вони там є
+        if name_tokens:
+            last_tok = name_tokens[-1].lower()
+            if last_tok in UNITS:
+                name_tokens.pop()
+                if name_tokens:
+                    try:
+                        parsed_q = float(name_tokens[-1].replace(',', '.').replace('O', '0'))
+                        # Відрізаємо цифру тільки якщо вона збігається з математикою
+                        if abs(parsed_q - math_qty) <= 0.05:
+                            name_tokens.pop()
+                    except:
+                        pass
+            else:
+                match_glued = re.match(r'^([\d.,]+)(шт|кг|л|м|уп)\.?$', last_tok)
                 if match_glued:
                     try:
-                        val = float(match_glued.group(1).replace(',', '.'))
-                        numbers.append(val)
-                        processed_count += 1
-                        continue
+                        parsed_q = float(match_glued.group(1).replace(',', '.'))
+                        if abs(parsed_q - math_qty) <= 0.05:
+                            name_tokens.pop()
                     except:
                         pass
-                
-                if re.match(r'^[\d.,]+$', token_fixed) and any(c.isdigit() for c in token_fixed):
+                else:
                     try:
-                        val = float(token_fixed.replace(',', '.'))
-                        numbers.append(val)
-                        processed_count += 1
-                        continue
+                        parsed_q = float(last_tok.replace(',', '.').replace('O', '0'))
+                        if abs(parsed_q - math_qty) <= 0.05:
+                            name_tokens.pop()
                     except:
                         pass
-                
-                if token.lower() in UNITS:
-                    processed_count += 1
-                    continue
-                    
-                if len(numbers) >= 2:
-                    break
-                else:
-                    break
-                    
-            if len(numbers) >= 2:
-                total = numbers[0]
-                price = numbers[1]
-                
-                if len(numbers) >= 3:
-                    qty = numbers[2]
-                else:
-                    qty = round(total / price, 2) if price else 1.0
-                
-                name_tokens = tokens[:-processed_count] if processed_count > 0 else tokens
-                name = " ".join(name_tokens).strip()
-                
-                if name and price > 0 and total > 0:
-                    items.append({
-                        "Артикул": art,
-                        "Рахунок": invoice_num,
-                        "Товар": name,
-                        "Кількість": qty,
-                        "Ціна": price,
-                        "Сума": total
-                    })
+        
+        name = " ".join(name_tokens).strip()
+        if name:
+            items.append({
+                "Артикул": art,
+                "Рахунок": invoice_num,
+                "Товар": name,
+                "Кількість": qty,
+                "Ціна": price,
+                "Сума": total
+            })
     return items
 
 uploaded_files = st.file_uploader("Перетягніть PDF-рахунки сюди", type="pdf", accept_multiple_files=True)
@@ -183,44 +196,28 @@ if uploaded_files:
 
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf_file:
                 for page in pdf_file.pages:
-                    table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
+                    # Витягуємо таблицю і склеюємо її в один рядок для нашого парсера
+                    table = page.extract_table({"vertical_strategy": "lines", "horizontal_strategy": "lines"})
                     if not table:
-                        table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "text"})
+                        table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
                         
                     if table:
+                        full_text = ""
                         for row in table:
-                            solid_cells = [str(c).strip() for c in row if c is not None and str(c).strip() != ""]
-                            if not solid_cells: continue
-                            
-                            first_word = solid_cells[0].split()[0].replace('.', '')
-                            if first_word.isdigit() and len(solid_cells) >= 5:
-                                try:
-                                    sum_val = float(re.sub(r'[^\d.,]', '', solid_cells[-1]).replace(',', '.'))
-                                    price_val = float(re.sub(r'[^\d.,]', '', solid_cells[-2]).replace(',', '.'))
-                                    
-                                    qty_str = solid_cells[-3]
-                                    if not any(char.isdigit() for char in qty_str):
-                                        qty_str = solid_cells[-4]
-                                        item_name = " ".join(solid_cells[2:-4])
-                                    else:
-                                        item_name = " ".join(solid_cells[2:-3])
-                                        
-                                    qty_val = float(re.sub(r'[^\d.,]', '', qty_str).replace(',', '.'))
-                                    article = solid_cells[1]
-                                    
-                                    page_items.append({
-                                        "Артикул": article, "Рахунок": invoice_num, "Товар": item_name,
-                                        "Кількість": qty_val, "Ціна": price_val, "Сума": sum_val
-                                    })
-                                except Exception:
-                                    pass
+                            clean_row = [str(c).replace('\n', ' ').strip() for c in row if c is not None]
+                            if clean_row:
+                                full_text += " ".join(clean_row) + "\n"
+                        extracted_raw_text += full_text
+                        page_items.extend(parse_extracted_text(full_text, invoice_num))
                     
+                    # Якщо таблиці немає, беремо сирий текст
                     if not page_items:
                         text = page.extract_text()
                         if text:
                             extracted_raw_text += text + "\n"
                             page_items.extend(parse_extracted_text(text, invoice_num))
 
+                    # Якщо і це не допомогло, запускаємо OCR
                     if not page_items:
                         status_text.text(f"Файл {file.name} - це фотографія. Запускаю OCR сканер...")
                         try:
@@ -234,9 +231,9 @@ if uploaded_files:
                             page_items.extend(parse_extracted_text(ocr_text, invoice_num))
                             
                         except pytesseract.TesseractNotFoundError:
-                            st.error(f"❌ Системна помилка: Сервер не знайшов OCR сканер. Переконайтеся, що файл packages.txt містить tesseract-ocr і ви зробили Reboot app у налаштуваннях Streamlit.")
+                            st.error(f"❌ Системна помилка: Сервер не знайшов OCR сканер.")
                         except Exception as e:
-                            st.error(f"❌ Помилка при скануванні фотографії {file.name}: {str(e)}")
+                            pass
             
             debug_logs[file.name] = extracted_raw_text
             
@@ -252,7 +249,7 @@ if uploaded_files:
         if all_items:
             df = pd.DataFrame(all_items)
             
-            # Генеруємо назву файлу з унікальних номерів рахунків (через підкреслення)
+            # Генеруємо назву файлу з номерів
             unique_invoices_list = sorted(df["Рахунок"].unique().astype(str))
             unique_invoices_str = ", ".join(unique_invoices_list)
             file_name_out = f"Vydatkova_{'_'.join(unique_invoices_list)}.pdf"
@@ -309,40 +306,57 @@ if uploaded_files:
             
             total_invoice_sum = 0
             for idx, row in summary_df.iterrows():
-                # Примусово очищаємо артикул і назву від невидимих переносів рядків (ентерів)
+                # Жорстка зачистка артикулу від прихованих ентерів та скорочення, якщо він гігантський
                 clean_articul = re.sub(r'\s+', ' ', str(row['Артикул'])).strip()
-                if len(clean_articul) > 15:
-                    clean_articul = clean_articul[:12] + "..."
+                if len(clean_articul) > 10:
+                    clean_articul = clean_articul[:9] + "…"
                     
                 clean_name = re.sub(r'\s+', ' ', str(row['Товар'])).strip()
-                
-                # Задаємо безпечну ширину 42, щоб текст 100% не вилазив за 100мм колонку
                 wrapped_name = textwrap.fill(clean_name, width=42, break_long_words=True)
                 lines_count = len(wrapped_name.split('\n'))
                 
-                line_height_for_multi = 6
-                if lines_count == 1:
-                    row_height = 8
-                    line_height_for_multi = 8
-                else:
-                    row_height = line_height_for_multi * lines_count
+                row_height = max(8, lines_count * 5 + 2)
                 
-                x_start = pdf.get_x()
-                y_start = pdf.get_y()
+                # Захист від розриву таблиці в кінці сторінки
+                if pdf.get_y() + row_height > 270:
+                    pdf.add_page()
+                    for i in range(len(headers)):
+                        pdf.cell(col_widths[i], 8, txt=headers[i], border=1, align='C')
+                    pdf.ln()
+
+                x = pdf.get_x()
+                y = pdf.get_y()
                 
-                pdf.cell(col_widths[0], row_height, txt=str(idx+1), border=1, align='C')
-                pdf.cell(col_widths[1], row_height, txt=clean_articul, border=1, align='C')
+                # Ручне малювання бездоганної сітки (гарантує відсутність накладання ліній)
+                pdf.rect(x, y, col_widths[0], row_height)
+                pdf.rect(x + sum(col_widths[:1]), y, col_widths[1], row_height)
+                pdf.rect(x + sum(col_widths[:2]), y, col_widths[2], row_height)
+                pdf.rect(x + sum(col_widths[:3]), y, col_widths[3], row_height)
+                pdf.rect(x + sum(col_widths[:4]), y, col_widths[4], row_height)
+                pdf.rect(x + sum(col_widths[:5]), y, col_widths[5], row_height)
                 
-                x_after_articul = pdf.get_x()
-                pdf.multi_cell(col_widths[2], line_height_for_multi, txt=wrapped_name, border=1, align='L')
+                y_center = y + (row_height - 6) / 2
                 
-                pdf.set_xy(x_after_articul + col_widths[2], y_start)
+                # Вписування тексту у сітку без рамок (border=0)
+                pdf.set_xy(x, y_center)
+                pdf.cell(col_widths[0], 6, txt=str(idx+1), border=0, align='C')
                 
-                pdf.cell(col_widths[3], row_height, txt=f"{int(row['Кількість'])} шт", border=1, align='C')
-                pdf.cell(col_widths[4], row_height, txt=f"{row['Ціна']:.2f}", border=1, align='C')
-                pdf.cell(col_widths[5], row_height, txt=f"{row['Сума']:.2f}", border=1, align='C')
+                pdf.set_xy(x + sum(col_widths[:1]), y_center)
+                pdf.cell(col_widths[1], 6, txt=clean_articul, border=0, align='C')
                 
-                pdf.ln(row_height)
+                pdf.set_xy(x + sum(col_widths[:2]) + 1, y + 1)
+                pdf.multi_cell(col_widths[2] - 2, 5, txt=wrapped_name, border=0, align='L')
+                
+                pdf.set_xy(x + sum(col_widths[:3]), y_center)
+                pdf.cell(col_widths[3], 6, txt=f"{int(row['Кількість'])} шт", border=0, align='C')
+                
+                pdf.set_xy(x + sum(col_widths[:4]), y_center)
+                pdf.cell(col_widths[4], 6, txt=f"{row['Ціна']:.2f}", border=0, align='C')
+                
+                pdf.set_xy(x + sum(col_widths[:5]), y_center)
+                pdf.cell(col_widths[5], 6, txt=f"{row['Сума']:.2f}", border=0, align='C')
+                
+                pdf.set_xy(x, y + row_height)
                 total_invoice_sum += row['Сума']
             
             pdf.ln(5)
