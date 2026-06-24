@@ -84,157 +84,122 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-# --- ЛОГІКА РОЗБОРУ РЯДКА З АНТИ-СМІТТЄВИМ ФІЛЬТРОМ ---
-def try_parse_line(line, invoice_num):
+# --- НОВИЙ АБСОЛЮТНИЙ ПАРСЕР РЯДКІВ (З ІГНОРУВАННЯМ СМІТТЯ) ---
+def parse_text_block(text, invoice_num):
+    items = []
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
-    line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
-    line = re.sub(r'\s+', ' ', line)
     
-    if not line or "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
-        return None
-
-    # Відрізаємо сміття з початку рядка (все до першої цифри)
-    raw_tokens = line.split()
-    start_idx = -1
-    for i, t in enumerate(raw_tokens):
-        if any(char.isdigit() for char in t):
-            start_idx = i
-            break
-            
-    if start_idx == -1:
-        return None 
+    for line in text.split('\n'):
+        line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
+        line = re.sub(r'\s+', ' ', line)
         
-    cleaned_tokens = raw_tokens[start_idx:]
-    rest = " ".join(cleaned_tokens)
-    art = ""
-    
-    match_idx = re.match(r'^(\d{1,4})\s+(.+)$', rest)
-    if match_idx:
-        rest = match_idx.group(2)
-    
-    match_art = re.match(r'^([A-Za-zА-Яа-яІіЇїЄє0-9/-]*\d[A-Za-zА-Яа-яІіЇїЄє0-9/-]*)\s+(.+)$', rest)
-    if match_art:
-        art = match_art.group(1)
-        rest = match_art.group(2)
-        
-    # Склеюємо числа, якщо сканер замість крапки поставив пробіл
-    raw_tokens = rest.split()
-    tokens = []
-    i = 0
-    while i < len(raw_tokens):
-        tok = raw_tokens[i].replace('O', '0').replace('o', '0').replace(',', '.')
-        if i < len(raw_tokens) - 1:
-            next_tok = raw_tokens[i+1].replace('O', '0').replace('o', '0')
-            if re.match(r'^\d+$', tok) and re.match(r'^\d{2}$', next_tok):
-                tokens.append(tok + "." + next_tok)
-                i += 2
-                continue
-        tokens.append(tok)
-        i += 1
-
-    if len(tokens) < 3:
-        return None
-        
-    rev_tokens = list(reversed(tokens))
-    numbers = []
-    processed = 0
-
-    for tok in rev_tokens:
-        if tok.lower() in UNITS:
-            processed += 1
+        if not line or "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
             continue
+            
+        tokens = line.split()
         
-        m = re.match(r'^([\d.]+)([а-яА-Яa-zA-Z.]+)$', tok)
-        if m and m.group(2).lower() in UNITS:
-            try:
-                numbers.append(float(m.group(1)))
+        # Знаходимо всі слова, які містять хоча б одну цифру
+        tokens_with_digits = [i for i, t in enumerate(tokens) if any(c.isdigit() for c in t)]
+        if len(tokens_with_digits) < 3: # Мінімум: Артикул, Ціна, Сума
+            continue
+            
+        first_digit_idx = tokens_with_digits[0]
+        second_digit_idx = tokens_with_digits[1]
+        
+        art = ""
+        # Визначаємо, чи перша цифра - це порядковий номер (1, 2, 3...) чи сам Артикул
+        if re.match(r'^\d{1,3}$', tokens[first_digit_idx].replace('.', '')):
+            # Якщо перша цифра коротка (номер), перевіряємо, чи є ще цифри до ціни/суми
+            if second_digit_idx < len(tokens) - 2:
+                art = tokens[second_digit_idx] # Беремо другу цифру як Артикул
+                tokens = tokens[second_digit_idx + 1 :] # Відрізаємо все до артикулу (вкл. сміття)
+            else:
+                art = tokens[first_digit_idx] # Це і є Артикул
+                tokens = tokens[first_digit_idx + 1 :]
+        else:
+            # Якщо перша цифра довга або з буквами (ТПUT-123) - це точно Артикул
+            art = tokens[first_digit_idx]
+            tokens = tokens[first_digit_idx + 1 :]
+            
+        # Склеюємо розірвані сканером копійки (напр. "222 00" -> "222.00")
+        new_tokens = []
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i].replace('O', '0').replace('o', '0').replace(',', '.')
+            if i < len(tokens) - 1:
+                next_tok = tokens[i+1].replace('O', '0').replace('o', '0')
+                if re.match(r'^\d+$', tok) and re.match(r'^\d{2}$', next_tok):
+                    new_tokens.append(tok + "." + next_tok)
+                    i += 2
+                    continue
+            new_tokens.append(tok)
+            i += 1
+            
+        if len(new_tokens) < 2: continue
+        
+        # Читаємо числа з кінця рядка
+        rev_tokens = list(reversed(new_tokens))
+        numbers = []
+        processed = 0
+
+        for tok in rev_tokens:
+            if tok.lower() in UNITS:
                 processed += 1
                 continue
-            except:
-                pass
             
-        if re.match(r'^[\d.]+$', tok) and any(c.isdigit() for c in tok):
-            if tok.count('.') <= 1:
+            m = re.match(r'^([\d.]+)([а-яА-Яa-zA-Z.]+)$', tok)
+            if m and m.group(2).lower() in UNITS:
                 try:
-                    numbers.append(float(tok))
+                    numbers.append(float(m.group(1)))
                     processed += 1
                     continue
                 except:
                     pass
                 
-        if len(numbers) >= 2:
-            break
+            if re.match(r'^[\d.]+$', tok) and any(c.isdigit() for c in tok):
+                if tok.count('.') <= 1:
+                    try:
+                        numbers.append(float(tok))
+                        processed += 1
+                        continue
+                    except:
+                        pass
+                    
+            if len(numbers) >= 2: break
+            
+        if len(numbers) < 2: continue
+        
+        total = numbers[0]
+        price = numbers[1]
+        qty = numbers[2] if len(numbers) >= 3 else 0.0
+        
+        if price <= 0 or total <= 0: continue
+        
+        # Математична автокорекція (виправляє баг OCR з "200 шт" і "44400 сума")
+        if qty > 0:
+            if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
+            elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
+            elif abs((qty / 100) * price - (total / 100)) < 0.1:
+                qty = qty / 100; total = total / 100
+            elif abs(qty * (price / 100) - (total / 100)) < 0.1:
+                price = price / 100; total = total / 100
         else:
-            break
+            qty = round(total / price, 2)
             
-    if len(numbers) < 2:
-        return None
+        if abs(qty * price - total) > 0.5: continue
         
-    total = numbers[0]
-    price = numbers[1]
-    qty = numbers[2] if len(numbers) >= 3 else 0.0
-    
-    if price <= 0 or total <= 0:
-        return None
+        name_tokens = new_tokens[:-processed] if processed > 0 else new_tokens
+        name = " ".join(name_tokens).strip()
         
-    # Математичний консенсус (виправляє загублені крапки, напр. 200 шт замість 2.00)
-    if qty > 0:
-        if abs((qty / 100) * price - total) < 0.1:
-            qty = qty / 100
-        elif abs(qty * price - (total / 100)) < 0.1:
-            total = total / 100
-        elif abs((qty / 100) * price - (total / 100)) < 0.1:
-            qty = qty / 100
-            total = total / 100
-        elif abs(qty * (price / 100) - (total / 100)) < 0.1:
-            price = price / 100
-            total = total / 100
-    else:
-        qty = round(total / price, 2)
-        
-    # Контрольна перевірка математики
-    if abs(qty * price - total) > 0.5:
-        return None
-    
-    name_tokens = tokens[:-processed] if processed > 0 else tokens
-    name = " ".join(name_tokens).strip()
-    
-    if name:
-        return {
-            "Артикул": art,
-            "Рахунок": invoice_num,
-            "Товар": name,
-            "Кількість": qty,
-            "Ціна": price,
-            "Сума": total
-        }
-    return None
-
-def parse_extracted_text(text, invoice_num):
-    items = []
-    raw_lines = text.split('\n')
-    
-    skip_next = False
-    for i in range(len(raw_lines)):
-        if skip_next:
-            skip_next = False
-            continue
-            
-        line = raw_lines[i]
-        item = try_parse_line(line, invoice_num)
-        
-        if item:
-            items.append(item)
-            continue
-            
-        if i < len(raw_lines) - 1:
-            next_line = raw_lines[i+1]
-            merged = line + " " + next_line
-            item_merged = try_parse_line(merged, invoice_num)
-            if item_merged:
-                items.append(item_merged)
-                skip_next = True
-                
+        if name:
+            items.append({
+                "Артикул": art,
+                "Рахунок": invoice_num,
+                "Товар": name,
+                "Кількість": qty,
+                "Ціна": price,
+                "Сума": total
+            })
     return items
 
 uploaded_files = st.file_uploader("Перетягніть PDF-рахунки сюди", type="pdf", accept_multiple_files=True)
@@ -265,6 +230,7 @@ if uploaded_files:
                     all_text_for_date += page_text + "\n"
                     extracted_raw_text += "--- ТЕКСТ СТОРІНКИ ---\n" + page_text + "\n"
                     
+                    # 1. Пробуємо ідеальну таблицю
                     table = page.extract_table({"vertical_strategy": "lines", "horizontal_strategy": "lines"})
                     if not table:
                         table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
@@ -276,34 +242,40 @@ if uploaded_files:
                             if clean_row:
                                 full_table_text += " ".join(clean_row) + "\n"
                         extracted_raw_text += "--- ТАБЛИЦЯ ---\n" + full_table_text + "\n"
-                        page_items.extend(parse_extracted_text(full_table_text, invoice_num))
+                        page_items.extend(parse_text_block(full_table_text, invoice_num))
                     
+                    # 2. Якщо таблиця не дала товарів, пробуємо текст
                     if not page_items and page_text:
-                        page_items.extend(parse_extracted_text(page_text, invoice_num))
+                        page_items.extend(parse_text_block(page_text, invoice_num))
 
-                    # ВМИКАЄМО ЧИСТИЙ OCR БЕЗ ФІЛЬТРІВ
+                    # 3. Якщо і це не вийшло (це векторний малюнок), застосовуємо БРОНЕБІЙНИЙ OCR
                     if not page_items:
-                        status_text.text(f"Файл {file.name} потребує оптичного сканування...")
+                        status_text.text(f"Файл {file.name} - складний малюнок. Вмикаю глибокий OCR сканер...")
                         try:
-                            # Читаємо просто у високій роздільній здатності
-                            img = page.to_image(resolution=400).original
+                            # Захоплюємо чорно-біле фото у високій якості
+                            img = page.to_image(resolution=400).original.convert('L')
+                            # Відсікаємо всі тіні і сірі лінії таблиць (робимо жорсткий трафарет)
+                            img = img.point(lambda x: 0 if x < 200 else 255, '1')
+                            
+                            # psm 6 - читати просто рядками (ігнорувати колонки)
+                            custom_config = r'--psm 6'
                             
                             try:
-                                ocr_text = pytesseract.image_to_string(img, lang='ukr+eng')
+                                ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config=custom_config)
                             except Exception:
                                 try:
-                                    ocr_text = pytesseract.image_to_string(img, lang='ukr')
+                                    ocr_text = pytesseract.image_to_string(img, lang='ukr', config=custom_config)
                                 except Exception:
-                                    ocr_text = pytesseract.image_to_string(img)
+                                    ocr_text = pytesseract.image_to_string(img, config=custom_config)
                                 
                             extracted_raw_text += "--- ТЕКСТ З OCR СКАНЕРА ---\n" + ocr_text + "\n"
                             all_text_for_date += ocr_text + "\n"
-                            page_items.extend(parse_extracted_text(ocr_text, invoice_num))
+                            page_items.extend(parse_text_block(ocr_text, invoice_num))
                             
                         except Exception as e:
                             pass
             
-            # --- РОЗШИРЕНИЙ ПОШУК ДАТИ РАХУНКУ ---
+            # --- ПОШУК ДАТИ РАХУНКУ ---
             date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*(?:[рpРP]\.?)?)', all_text_for_date, re.IGNORECASE)
             if date_match:
                 clean_date = re.sub(r'\s+', ' ', date_match.group(1)).strip()
