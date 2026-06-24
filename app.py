@@ -9,6 +9,7 @@ from fpdf import FPDF
 from datetime import datetime
 import textwrap
 import pytesseract
+from PIL import ImageEnhance
 
 st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
@@ -84,131 +85,161 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-# --- ПАРСЕР ЗІ СТОП-СЛОВАМИ (БЛОКУВАННЯ ШАПКИ ТА ПІДВАЛУ) ---
-def parse_text_block(text, invoice_num):
-    items = []
+def try_parse_line(line, invoice_num):
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
-    
-    # Список слів-маркерів, які гарантовано означають, що це не товар
     stop_phrases = [
         "постачальник", "покупець", "адреса:", "єдрпоу", "іпн", "рахунок-фактура",
         "хмельницька", "нетішин", "енергетиків", "приватбанк", "тел.", "+380",
         "гуменюк", "копійок", "отримав(ла)", "від виконавця", "найменувань", 
-        "разом:", "сума без пдв", "технології поля",
+        "разом:", "сума без пдв", "технології поля", "ферм є",
         "січня", "лютого", "березня", "квітня", "травня", "червня", 
         "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
         "р/р", "p/p", "ua393"
     ]
     
-    for line in text.split('\n'):
-        line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
-        line = re.sub(r'\s+', ' ', line)
+    line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
+    line = re.sub(r'\s+', ' ', line)
+    
+    if not line: return None
         
-        if not line:
-            continue
-            
-        # Якщо в рядку є хоч одне стоп-слово - одразу викидаємо його
-        line_lower = line.lower()
-        if any(phrase in line_lower for phrase in stop_phrases):
-            continue
-            
-        tokens = line.split()
+    line_lower = line.lower()
+    if any(phrase in line_lower for phrase in stop_phrases):
+        return None
         
-        tokens_with_digits = [i for i, t in enumerate(tokens) if any(c.isdigit() for c in t)]
-        if len(tokens_with_digits) < 3: 
-            continue
+    raw_tokens = line.split()
+    start_idx = -1
+    for i, t in enumerate(raw_tokens):
+        if any(char.isdigit() for char in t):
+            start_idx = i
+            break
             
-        first_digit_idx = tokens_with_digits[0]
-        second_digit_idx = tokens_with_digits[1]
+    if start_idx == -1: return None 
         
-        art = ""
-        if re.match(r'^\d{1,3}$', tokens[first_digit_idx].replace('.', '')):
-            if second_digit_idx < len(tokens) - 2:
-                art = tokens[second_digit_idx]
-                tokens = tokens[second_digit_idx + 1 :]
-            else:
-                art = tokens[first_digit_idx]
-                tokens = tokens[first_digit_idx + 1 :]
-        else:
-            art = tokens[first_digit_idx]
-            tokens = tokens[first_digit_idx + 1 :]
-            
-        new_tokens = []
-        i = 0
-        while i < len(tokens):
-            tok = tokens[i].replace('O', '0').replace('o', '0').replace(',', '.')
-            if i < len(tokens) - 1:
-                next_tok = tokens[i+1].replace('O', '0').replace('o', '0')
-                if re.match(r'^\d+$', tok) and re.match(r'^\d{2}$', next_tok):
-                    new_tokens.append(tok + "." + next_tok)
-                    i += 2
-                    continue
-            new_tokens.append(tok)
-            i += 1
-            
-        if len(new_tokens) < 2: continue
+    cleaned_tokens = raw_tokens[start_idx:]
+    rest = " ".join(cleaned_tokens)
+    art = ""
+    
+    match_idx = re.match(r'^(\d{1,4})\s+(.+)$', rest)
+    if match_idx:
+        rest = match_idx.group(2)
+    
+    match_art = re.match(r'^([A-Za-zА-Яа-яІіЇїЄє0-9/-]*\d[A-Za-zА-Яа-яІіЇїЄє0-9/-]*)\s+(.+)$', rest)
+    if match_art:
+        art = match_art.group(1)
+        rest = match_art.group(2)
         
-        rev_tokens = list(reversed(new_tokens))
-        numbers = []
-        processed = 0
+    raw_tokens = rest.split()
+    tokens = []
+    i = 0
+    while i < len(raw_tokens):
+        tok = raw_tokens[i].replace('O', '0').replace('o', '0').replace(',', '.')
+        if i < len(raw_tokens) - 1:
+            next_tok = raw_tokens[i+1].replace('O', '0').replace('o', '0')
+            if re.match(r'^\d+$', tok) and re.match(r'^\d{2}$', next_tok):
+                tokens.append(tok + "." + next_tok)
+                i += 2
+                continue
+        tokens.append(tok)
+        i += 1
 
-        for tok in rev_tokens:
-            if tok.lower() in UNITS:
+    if len(tokens) < 3: return None
+        
+    rev_tokens = list(reversed(tokens))
+    numbers = []
+    processed = 0
+
+    for tok in rev_tokens:
+        if tok.lower() in UNITS:
+            processed += 1
+            continue
+        
+        m = re.match(r'^([\d.]+)([а-яА-Яa-zA-Z.]+)$', tok)
+        if m and m.group(2).lower() in UNITS:
+            try:
+                numbers.append(float(m.group(1)))
                 processed += 1
                 continue
+            except: pass
             
-            m = re.match(r'^([\d.]+)([а-яА-Яa-zA-Z.]+)$', tok)
-            if m and m.group(2).lower() in UNITS:
+        if re.match(r'^[\d.]+$', tok) and any(c.isdigit() for c in tok):
+            if tok.count('.') <= 1:
                 try:
-                    numbers.append(float(m.group(1)))
+                    numbers.append(float(tok))
                     processed += 1
                     continue
-                except:
-                    pass
-                
-            if re.match(r'^[\d.]+$', tok) and any(c.isdigit() for c in tok):
-                if tok.count('.') <= 1:
-                    try:
-                        numbers.append(float(tok))
-                        processed += 1
-                        continue
-                    except:
-                        pass
+                except: pass
                     
-            if len(numbers) >= 2: break
+        if len(numbers) >= 2: break
             
-        if len(numbers) < 2: continue
+    if len(numbers) < 2: return None
         
-        total = numbers[0]
-        price = numbers[1]
-        qty = numbers[2] if len(numbers) >= 3 else 0.0
+    total = numbers[0]
+    price = numbers[1]
+    qty = numbers[2] if len(numbers) >= 3 else 0.0
+    
+    if price <= 0 or total <= 0: return None
         
-        if price <= 0 or total <= 0: continue
+    if qty > 0:
+        if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
+        elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
+        elif abs((qty / 100) * price - (total / 100)) < 0.1:
+            qty = qty / 100; total = total / 100
+        elif abs(qty * (price / 100) - (total / 100)) < 0.1:
+            price = price / 100; total = total / 100
+    else:
+        qty = round(total / price, 2)
         
-        if qty > 0:
-            if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
-            elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
-            elif abs((qty / 100) * price - (total / 100)) < 0.1:
-                qty = qty / 100; total = total / 100
-            elif abs(qty * (price / 100) - (total / 100)) < 0.1:
-                price = price / 100; total = total / 100
-        else:
-            qty = round(total / price, 2)
+    if abs(qty * price - total) > 0.5: return None
+    
+    name_tokens = tokens[:-processed] if processed > 0 else tokens
+    name = " ".join(name_tokens).strip()
+    
+    if name:
+        return {
+            "Артикул": art,
+            "Рахунок": invoice_num,
+            "Товар": name,
+            "Кількість": qty,
+            "Ціна": price,
+            "Сума": total
+        }
+    return None
+
+def parse_text_block(text, invoice_num):
+    items = []
+    raw_lines = text.split('\n')
+    
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+        
+        # 1. Спроба прочитати як один рядок
+        item = try_parse_line(line, invoice_num)
+        if item:
+            items.append(item)
+            i += 1
+            continue
             
-        if abs(qty * price - total) > 0.5: continue
+        # 2. Спроба склеїти 2 рядки (якщо сканер розірвав товар)
+        if i < len(raw_lines) - 1:
+            merged = line + " " + raw_lines[i+1]
+            item_merged = try_parse_line(merged, invoice_num)
+            if item_merged:
+                items.append(item_merged)
+                i += 2
+                continue
+                
+        # 3. Спроба склеїти 3 рядки (якщо таблиця дуже складна)
+        if i < len(raw_lines) - 2:
+            merged2 = line + " " + raw_lines[i+1] + " " + raw_lines[i+2]
+            item_merged2 = try_parse_line(merged2, invoice_num)
+            if item_merged2:
+                items.append(item_merged2)
+                i += 3
+                continue
         
-        name_tokens = new_tokens[:-processed] if processed > 0 else new_tokens
-        name = " ".join(name_tokens).strip()
-        
-        if name:
-            items.append({
-                "Артикул": art,
-                "Рахунок": invoice_num,
-                "Товар": name,
-                "Кількість": qty,
-                "Ціна": price,
-                "Сума": total
-            })
+        i += 1
+                
     return items
 
 uploaded_files = st.file_uploader("Перетягніть PDF-рахунки сюди", type="pdf", accept_multiple_files=True)
@@ -255,30 +286,38 @@ if uploaded_files:
                     if not page_items and page_text:
                         page_items.extend(parse_text_block(page_text, invoice_num))
 
+                    # МУЛЬТИ-СКАНЕР (ПЕРЕБИРАЄ ВСІ РЕЖИМИ, ПОКИ НЕ ЗНАЙДЕ ТОВАР)
                     if not page_items:
-                        status_text.text(f"Файл {file.name} - складний малюнок. Вмикаю глибокий OCR сканер...")
+                        status_text.text(f"Файл {file.name} - складний малюнок. Вмикаю Мульти-сканер...")
                         try:
                             img = page.to_image(resolution=400).original.convert('L')
-                            img = img.point(lambda x: 0 if x < 200 else 255, '1')
+                            enhancer = ImageEnhance.Contrast(img)
+                            img = enhancer.enhance(1.5) # Помірний контраст, щоб не ламати лінії
                             
-                            custom_config = r'--psm 6'
+                            # psm 6 (блок), psm 4 (колонка - ідеально для таблиць), psm 3 (стандарт), psm 11 (хаос)
+                            ocr_configs = [r'--psm 6', r'--psm 4', r'--psm 3', r'--psm 11']
                             
-                            try:
-                                ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config=custom_config)
-                            except Exception:
+                            for config in ocr_configs:
                                 try:
-                                    ocr_text = pytesseract.image_to_string(img, lang='ukr', config=custom_config)
+                                    ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config=config)
                                 except Exception:
-                                    ocr_text = pytesseract.image_to_string(img, config=custom_config)
+                                    try:
+                                        ocr_text = pytesseract.image_to_string(img, lang='ukr', config=config)
+                                    except Exception:
+                                        ocr_text = pytesseract.image_to_string(img, config=config)
+                                        
+                                extracted_raw_text += f"\n--- ТЕКСТ З OCR ({config}) ---\n" + ocr_text + "\n"
+                                parsed = parse_text_block(ocr_text, invoice_num)
                                 
-                            extracted_raw_text += "--- ТЕКСТ З OCR СКАНЕРА ---\n" + ocr_text + "\n"
-                            all_text_for_date += ocr_text + "\n"
-                            page_items.extend(parse_text_block(ocr_text, invoice_num))
-                            
+                                if parsed:
+                                    page_items.extend(parsed)
+                                    all_text_for_date += ocr_text + "\n"
+                                    break # Якщо товар знайдено, зупиняємо перебір!
+                                    
                         except Exception as e:
                             pass
             
-            # --- РОЗШИРЕНИЙ ПОШУК ДАТИ РАХУНКУ ---
+            # --- ПОШУК ДАТИ РАХУНКУ ---
             date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*(?:[рpРP]\.?)?)', all_text_for_date, re.IGNORECASE)
             if date_match:
                 clean_date = re.sub(r'\s+', ' ', date_match.group(1)).strip()
