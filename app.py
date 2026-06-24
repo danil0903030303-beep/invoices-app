@@ -9,12 +9,11 @@ from fpdf import FPDF
 from datetime import datetime
 import textwrap
 import pytesseract
-from PIL import ImageEnhance
+from PIL import ImageEnhance, ImageFilter
 
 st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
 
-# --- ФУНКЦІЯ ДЛЯ СУМИ ПРОПИСОМ ---
 def number_to_words_uah(amount):
     def get_words(num, is_female=False):
         units = ["", "один", "два", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
@@ -85,7 +84,7 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-def try_parse_line(line, invoice_num):
+def parse_line_logic(line, invoice_num):
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
     stop_phrases = [
         "постачальник", "покупець", "адреса:", "єдрпоу", "іпн", "рахунок-фактура",
@@ -101,50 +100,54 @@ def try_parse_line(line, invoice_num):
     line = re.sub(r'\s+', ' ', line)
     
     if not line: return None
-        
-    line_lower = line.lower()
-    if any(phrase in line_lower for phrase in stop_phrases):
-        return None
+    if any(phrase in line.lower() for phrase in stop_phrases): return None
         
     raw_tokens = line.split()
-    start_idx = -1
+    
+    first_digit_idx = -1
     for i, t in enumerate(raw_tokens):
-        if any(char.isdigit() for char in t):
-            start_idx = i
+        if any(c.isdigit() for c in t):
+            first_digit_idx = i
             break
             
-    if start_idx == -1: return None 
+    if first_digit_idx == -1: return None 
         
-    cleaned_tokens = raw_tokens[start_idx:]
-    rest = " ".join(cleaned_tokens)
+    # Відрізаємо текстове сміття до першої цифри
+    tokens = raw_tokens[first_digit_idx:]
+    if len(tokens) < 3: return None
+    
     art = ""
+    tok0 = tokens[0]
     
-    match_idx = re.match(r'^(\d{1,4})\s+(.+)$', rest)
-    if match_idx:
-        rest = match_idx.group(2)
-    
-    match_art = re.match(r'^([A-Za-zА-Яа-яІіЇїЄє0-9/-]*\d[A-Za-zА-Яа-яІіЇїЄє0-9/-]*)\s+(.+)$', rest)
-    if match_art:
-        art = match_art.group(1)
-        rest = match_art.group(2)
+    if re.match(r'^\d{1,4}$', tok0.replace('.', '')):
+        if len(tokens) > 1 and any(c.isdigit() for c in tokens[1]):
+            art = tokens[1]
+            tokens = tokens[2:]
+        else:
+            art = tok0
+            tokens = tokens[1:]
+    else:
+        art = tok0
+        tokens = tokens[1:]
         
-    raw_tokens = rest.split()
-    tokens = []
+    if len(tokens) < 2: return None
+        
+    new_tokens = []
     i = 0
-    while i < len(raw_tokens):
-        tok = raw_tokens[i].replace('O', '0').replace('o', '0').replace(',', '.')
-        if i < len(raw_tokens) - 1:
-            next_tok = raw_tokens[i+1].replace('O', '0').replace('o', '0')
+    while i < len(tokens):
+        tok = tokens[i].replace('O', '0').replace('o', '0').replace(',', '.')
+        if i < len(tokens) - 1:
+            next_tok = tokens[i+1].replace('O', '0').replace('o', '0')
             if re.match(r'^\d+$', tok) and re.match(r'^\d{2}$', next_tok):
-                tokens.append(tok + "." + next_tok)
+                new_tokens.append(tok + "." + next_tok)
                 i += 2
                 continue
-        tokens.append(tok)
+        new_tokens.append(tok)
         i += 1
-
-    if len(tokens) < 3: return None
         
-    rev_tokens = list(reversed(tokens))
+    if len(new_tokens) < 2: return None
+    
+    rev_tokens = list(reversed(new_tokens))
     numbers = []
     processed = 0
 
@@ -168,17 +171,17 @@ def try_parse_line(line, invoice_num):
                     processed += 1
                     continue
                 except: pass
-                    
+                
         if len(numbers) >= 2: break
-            
-    if len(numbers) < 2: return None
         
+    if len(numbers) < 2: return None
+    
     total = numbers[0]
     price = numbers[1]
     qty = numbers[2] if len(numbers) >= 3 else 0.0
     
     if price <= 0 or total <= 0: return None
-        
+    
     if qty > 0:
         if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
         elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
@@ -191,7 +194,7 @@ def try_parse_line(line, invoice_num):
         
     if abs(qty * price - total) > 0.5: return None
     
-    name_tokens = tokens[:-processed] if processed > 0 else tokens
+    name_tokens = new_tokens[:-processed] if processed > 0 else new_tokens
     name = " ".join(name_tokens).strip()
     
     if name:
@@ -213,31 +216,27 @@ def parse_text_block(text, invoice_num):
     while i < len(raw_lines):
         line = raw_lines[i]
         
-        # 1. Спроба прочитати як один рядок
-        item = try_parse_line(line, invoice_num)
+        item = parse_line_logic(line, invoice_num)
         if item:
             items.append(item)
             i += 1
             continue
             
-        # 2. Спроба склеїти 2 рядки (якщо сканер розірвав товар)
         if i < len(raw_lines) - 1:
             merged = line + " " + raw_lines[i+1]
-            item_merged = try_parse_line(merged, invoice_num)
+            item_merged = parse_line_logic(merged, invoice_num)
             if item_merged:
                 items.append(item_merged)
                 i += 2
                 continue
                 
-        # 3. Спроба склеїти 3 рядки (якщо таблиця дуже складна)
         if i < len(raw_lines) - 2:
             merged2 = line + " " + raw_lines[i+1] + " " + raw_lines[i+2]
-            item_merged2 = try_parse_line(merged2, invoice_num)
+            item_merged2 = parse_line_logic(merged2, invoice_num)
             if item_merged2:
                 items.append(item_merged2)
                 i += 3
                 continue
-        
         i += 1
                 
     return items
@@ -286,38 +285,46 @@ if uploaded_files:
                     if not page_items and page_text:
                         page_items.extend(parse_text_block(page_text, invoice_num))
 
-                    # МУЛЬТИ-СКАНЕР (ПЕРЕБИРАЄ ВСІ РЕЖИМИ, ПОКИ НЕ ЗНАЙДЕ ТОВАР)
+                    # ГЛИБОКИЙ OCR ІЗ ПЕРЕБОРОМ ФІЛЬТРІВ
                     if not page_items:
-                        status_text.text(f"Файл {file.name} - складний малюнок. Вмикаю Мульти-сканер...")
+                        status_text.text(f"Файл {file.name}: застосування глибокого OCR сканування...")
                         try:
-                            img = page.to_image(resolution=400).original.convert('L')
-                            enhancer = ImageEnhance.Contrast(img)
-                            img = enhancer.enhance(1.5) # Помірний контраст, щоб не ламати лінії
+                            img_raw = page.to_image(resolution=400).original.convert('L')
                             
-                            # psm 6 (блок), psm 4 (колонка - ідеально для таблиць), psm 3 (стандарт), psm 11 (хаос)
-                            ocr_configs = [r'--psm 6', r'--psm 4', r'--psm 3', r'--psm 11']
+                            # Потовщення тонких ліній + високий контраст
+                            img_thick = img_raw.filter(ImageFilter.BoxBlur(1))
+                            img_thick = ImageEnhance.Contrast(img_thick).enhance(3.0)
                             
-                            for config in ocr_configs:
-                                try:
-                                    ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config=config)
-                                except Exception:
+                            # Просто високий контраст
+                            img_contrast = ImageEnhance.Contrast(img_raw).enhance(2.0)
+                            
+                            images_to_try = [img_raw, img_thick, img_contrast]
+                            ocr_configs = [r'--psm 6', r'--psm 4', r'--psm 3']
+                            
+                            found = False
+                            for img_var in images_to_try:
+                                if found: break
+                                for config in ocr_configs:
                                     try:
-                                        ocr_text = pytesseract.image_to_string(img, lang='ukr', config=config)
+                                        ocr_text = pytesseract.image_to_string(img_var, lang='ukr+eng', config=config)
                                     except Exception:
-                                        ocr_text = pytesseract.image_to_string(img, config=config)
+                                        try:
+                                            ocr_text = pytesseract.image_to_string(img_var, lang='ukr', config=config)
+                                        except Exception:
+                                            ocr_text = pytesseract.image_to_string(img_var, config=config)
                                         
-                                extracted_raw_text += f"\n--- ТЕКСТ З OCR ({config}) ---\n" + ocr_text + "\n"
-                                parsed = parse_text_block(ocr_text, invoice_num)
-                                
-                                if parsed:
-                                    page_items.extend(parsed)
-                                    all_text_for_date += ocr_text + "\n"
-                                    break # Якщо товар знайдено, зупиняємо перебір!
+                                    extracted_raw_text += f"\n--- ТЕКСТ З OCR ({config}) ---\n" + ocr_text + "\n"
+                                    parsed = parse_text_block(ocr_text, invoice_num)
                                     
+                                    if parsed:
+                                        page_items.extend(parsed)
+                                        all_text_for_date += ocr_text + "\n"
+                                        found = True
+                                        break
+                                        
                         except Exception as e:
                             pass
             
-            # --- ПОШУК ДАТИ РАХУНКУ ---
             date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*(?:[рpРP]\.?)?)', all_text_for_date, re.IGNORECASE)
             if date_match:
                 clean_date = re.sub(r'\s+', ' ', date_match.group(1)).strip()
@@ -368,7 +375,6 @@ if uploaded_files:
                     final_date_str = final_date_str.replace(eng, ukr)
                 final_date_str += " р."
             
-            # --- ГЕНЕРАЦІЯ PDF ---
             pdf = FPDF()
             pdf.add_page()
             
