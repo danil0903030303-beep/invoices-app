@@ -13,6 +13,7 @@ import pytesseract
 st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
 
+# --- ФУНКЦІЯ ДЛЯ СУМИ ПРОПИСОМ ---
 def number_to_words_uah(amount):
     def get_words(num, is_female=False):
         units = ["", "один", "два", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
@@ -73,6 +74,7 @@ def number_to_words_uah(amount):
     res = re.sub(' +', ' ', res).capitalize()
     return f"{res} {kop:02d} копійок"
 
+# Автоматичне завантаження шрифтів
 @st.cache_resource
 def get_fonts():
     reg_path = "Roboto-Regular.ttf"
@@ -83,6 +85,7 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
+# --- МАТЕМАТИЧНИЙ ПАРСЕР ---
 def parse_extracted_text(text, invoice_num):
     items = []
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
@@ -184,27 +187,30 @@ if uploaded_files:
 
             page_items = []
             extracted_raw_text = ""
+            all_text_for_date = ""
 
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf_file:
                 for page in pdf_file.pages:
+                    # ЗАВЖДИ витягуємо весь текст сторінки для пошуку дати
+                    page_text = page.extract_text() or ""
+                    all_text_for_date += page_text + "\n"
+                    extracted_raw_text += "--- ТЕКСТ СТОРІНКИ ---\n" + page_text + "\n"
+                    
                     table = page.extract_table({"vertical_strategy": "lines", "horizontal_strategy": "lines"})
                     if not table:
                         table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
                         
                     if table:
-                        full_text = ""
+                        full_table_text = ""
                         for row in table:
                             clean_row = [str(c).replace('\n', ' ').strip() for c in row if c is not None]
                             if clean_row:
-                                full_text += " ".join(clean_row) + "\n"
-                        extracted_raw_text += full_text
-                        page_items.extend(parse_extracted_text(full_text, invoice_num))
+                                full_table_text += " ".join(clean_row) + "\n"
+                        extracted_raw_text += "--- ТАБЛИЦЯ ---\n" + full_table_text + "\n"
+                        page_items.extend(parse_extracted_text(full_table_text, invoice_num))
                     
-                    if not page_items:
-                        text = page.extract_text()
-                        if text:
-                            extracted_raw_text += text + "\n"
-                            page_items.extend(parse_extracted_text(text, invoice_num))
+                    if not page_items and page_text:
+                        page_items.extend(parse_extracted_text(page_text, invoice_num))
 
                     if not page_items:
                         status_text.text(f"Файл {file.name} - це фотографія. Запускаю OCR сканер...")
@@ -216,6 +222,7 @@ if uploaded_files:
                                 ocr_text = pytesseract.image_to_string(img)
                                 
                             extracted_raw_text += "--- ТЕКСТ З OCR СКАНЕРА ---\n" + ocr_text + "\n"
+                            all_text_for_date += ocr_text + "\n"
                             page_items.extend(parse_extracted_text(ocr_text, invoice_num))
                             
                         except pytesseract.TesseractNotFoundError:
@@ -223,14 +230,24 @@ if uploaded_files:
                         except Exception as e:
                             pass
             
-            # --- ПОШУК ДАТИ РАХУНКУ ---
-            date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*[рpРP]\.?)', extracted_raw_text, re.IGNORECASE)
+            # --- РОЗШИРЕНИЙ ПОШУК ДАТИ РАХУНКУ ---
+            date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*(?:[рpРP]\.?)?)', all_text_for_date, re.IGNORECASE)
             if date_match:
                 clean_date = re.sub(r'\s+', ' ', date_match.group(1)).strip()
                 clean_date = clean_date.replace('p', 'р').replace('P', 'Р')
-                if not clean_date.endswith('.'):
+                if not clean_date.endswith('.') and clean_date.endswith('р'):
                     clean_date += '.'
+                elif not clean_date.endswith('.') and not clean_date.endswith('р'):
+                    clean_date += ' р.'
                 invoice_dates.add(clean_date)
+            else:
+                # Резервний пошук, якщо дата написана як 15.05.2026
+                date_match_num = re.search(r'(\d{2})\.(\d{2})\.(\d{4})', all_text_for_date)
+                if date_match_num:
+                    d, m, y = date_match_num.groups()
+                    months_ukr = {"01":"січня", "02":"лютого", "03":"березня", "04":"квітня", "05":"травня", "06":"червня", "07":"липня", "08":"серпня", "09":"вересня", "10":"жовтня", "11":"листопада", "12":"грудня"}
+                    if m in months_ukr:
+                        invoice_dates.add(f"{int(d)} {months_ukr[m]} {y} р.")
             # --------------------------
 
             debug_logs[file.name] = extracted_raw_text
@@ -257,7 +274,7 @@ if uploaded_files:
             })
             summary_df["Ціна"] = (summary_df["Сума"] / summary_df["Кількість"]).round(2)
             
-            # Визначаємо фінальну дату для шапки
+            # Вставляємо знайдену дату, або сьогоднішню, якщо файл пошкоджено
             if invoice_dates:
                 final_date_str = ", ".join(sorted(list(invoice_dates)))
             else:
@@ -266,7 +283,7 @@ if uploaded_files:
                 for eng, ukr in months.items():
                     final_date_str = final_date_str.replace(eng, ukr)
                 final_date_str += " р."
-
+            
             # --- ГЕНЕРАЦІЯ PDF ---
             pdf = FPDF()
             pdf.add_page()
