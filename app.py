@@ -91,14 +91,12 @@ def parse_extracted_text(text, invoice_num):
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.'}
     
     for line in text.split('\n'):
-        # Очищення від сміття OCR
         line = line.replace('|', ' ').replace('_', ' ').strip()
         line = re.sub(r'\s+', ' ', line)
         
         if "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
             continue
 
-        # Шукаємо: [Опціональний №] [Артикул] [Назва та числа]
         match = re.search(r'^(?:\d{1,4}\s+)?([A-Za-z0-9/-]{3,})\s+(.+)$', line)
         if match:
             art = match.group(1)
@@ -108,12 +106,10 @@ def parse_extracted_text(text, invoice_num):
             numbers = []
             processed_count = 0
             
-            # Читаємо рядок з кінця до початку
             for token in reversed(tokens):
                 token_fixed = token.replace('O', '0').replace('o', '0')
                 token_fixed = token_fixed.replace('грн', '').replace('₴', '')
                 
-                # Якщо токен "злипся" з одиницею (напр. "2шт")
                 match_glued = re.match(r'^([\d.,]+)(шт|кг|л|м|уп)\.?$', token_fixed.lower())
                 if match_glued:
                     try:
@@ -124,7 +120,6 @@ def parse_extracted_text(text, invoice_num):
                     except:
                         pass
                 
-                # Якщо це просто число
                 if re.match(r'^[\d.,]+$', token_fixed) and any(c.isdigit() for c in token_fixed):
                     try:
                         val = float(token_fixed.replace(',', '.'))
@@ -134,29 +129,24 @@ def parse_extracted_text(text, invoice_num):
                     except:
                         pass
                 
-                # Якщо це одиниця виміру (ігноруємо її, йдемо далі)
                 if token.lower() in UNITS:
                     processed_count += 1
                     continue
                     
-                # Якщо ми дійшли до тексту, а в нас вже є 2 числа (Ціна і Сума) - зупиняємось
                 if len(numbers) >= 2:
                     break
                 else:
-                    # Якщо тексту багато, а чисел в кінці не було - це не товар
                     break
                     
             if len(numbers) >= 2:
                 total = numbers[0]
                 price = numbers[1]
                 
-                # МАГІЯ: Якщо сканер не побачив кількість, вираховуємо її самі!
                 if len(numbers) >= 3:
                     qty = numbers[2]
                 else:
                     qty = round(total / price, 2) if price else 1.0
                 
-                # Назва товару - це все, що ми не обробили з кінця
                 name_tokens = tokens[:-processed_count] if processed_count > 0 else tokens
                 name = " ".join(name_tokens).strip()
                 
@@ -193,7 +183,6 @@ if uploaded_files:
 
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf_file:
                 for page in pdf_file.pages:
-                    # МЕТОД 1: Читання таблиці
                     table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
                     if not table:
                         table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "text"})
@@ -226,14 +215,12 @@ if uploaded_files:
                                 except Exception:
                                     pass
                     
-                    # МЕТОД 2: Читання тексту (якщо таблиця не вийшла)
                     if not page_items:
                         text = page.extract_text()
                         if text:
                             extracted_raw_text += text + "\n"
                             page_items.extend(parse_extracted_text(text, invoice_num))
 
-                    # МЕТОД 3: OCR (якщо сторінка - це просто фотографія без тексту)
                     if not page_items:
                         status_text.text(f"Файл {file.name} - це фотографія. Запускаю OCR сканер...")
                         try:
@@ -265,8 +252,10 @@ if uploaded_files:
         if all_items:
             df = pd.DataFrame(all_items)
             
-            # Витягуємо всі унікальні номери рахунків для шапки
-            unique_invoices = ", ".join(sorted(df["Рахунок"].unique().astype(str)))
+            # Генеруємо назву файлу з унікальних номерів рахунків (через підкреслення)
+            unique_invoices_list = sorted(df["Рахунок"].unique().astype(str))
+            unique_invoices_str = ", ".join(unique_invoices_list)
+            file_name_out = f"Vydatkova_{'_'.join(unique_invoices_list)}.pdf"
             
             summary_df = df.groupby(["Артикул", "Товар"], as_index=False).agg({
                 "Кількість": "sum",
@@ -288,8 +277,7 @@ if uploaded_files:
             for eng, ukr in months.items():
                 current_date_eng = current_date_eng.replace(eng, ukr)
             
-            # Змінений заголовок з підстановкою номерів рахунків
-            pdf.cell(0, 10, txt=f"Видаткова накладна № {unique_invoices} від {current_date_eng} р.", ln=True, align='L')
+            pdf.cell(0, 10, txt=f"Видаткова накладна № {unique_invoices_str} від {current_date_eng} р.", ln=True, align='L')
             pdf.ln(5)
             
             pdf.set_font("Roboto", size=10)
@@ -313,7 +301,6 @@ if uploaded_files:
             pdf.multi_cell(0, 6, txt="ТОВ Технології Поля", border=0)
             pdf.ln(8)
             
-            # Оновлені ширини колонок без "Рахунку". Ширину передано на стовпець "Товар"
             col_widths = [10, 20, 100, 20, 20, 20]
             headers = ["№", "Артикул", "Товар", "Кількість", "Ціна", "Сума"]
             for i in range(len(headers)):
@@ -322,8 +309,15 @@ if uploaded_files:
             
             total_invoice_sum = 0
             for idx, row in summary_df.iterrows():
-                item_name = str(row['Товар'])
-                wrapped_name = textwrap.fill(item_name, width=50) # Збільшена ширина тексту для ширшої колонки
+                # Примусово очищаємо артикул і назву від невидимих переносів рядків (ентерів)
+                clean_articul = re.sub(r'\s+', ' ', str(row['Артикул'])).strip()
+                if len(clean_articul) > 15:
+                    clean_articul = clean_articul[:12] + "..."
+                    
+                clean_name = re.sub(r'\s+', ' ', str(row['Товар'])).strip()
+                
+                # Задаємо безпечну ширину 42, щоб текст 100% не вилазив за 100мм колонку
+                wrapped_name = textwrap.fill(clean_name, width=42, break_long_words=True)
                 lines_count = len(wrapped_name.split('\n'))
                 
                 line_height_for_multi = 6
@@ -337,7 +331,7 @@ if uploaded_files:
                 y_start = pdf.get_y()
                 
                 pdf.cell(col_widths[0], row_height, txt=str(idx+1), border=1, align='C')
-                pdf.cell(col_widths[1], row_height, txt=str(row['Артикул']), border=1, align='C')
+                pdf.cell(col_widths[1], row_height, txt=clean_articul, border=1, align='C')
                 
                 x_after_articul = pdf.get_x()
                 pdf.multi_cell(col_widths[2], line_height_for_multi, txt=wrapped_name, border=1, align='L')
@@ -378,7 +372,7 @@ if uploaded_files:
             st.download_button(
                 label="Завантажити видаткову (PDF)",
                 data=pdf_bytes,
-                file_name="Vydatkova_Zvedena.pdf",
+                file_name=file_name_out,
                 mime="application/pdf"
             )
         else:
