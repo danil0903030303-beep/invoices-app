@@ -265,8 +265,10 @@ if uploaded_files:
         if all_items:
             df = pd.DataFrame(all_items)
             
+            # Витягуємо всі унікальні номери рахунків для шапки
+            unique_invoices = ", ".join(sorted(df["Рахунок"].unique().astype(str)))
+            
             summary_df = df.groupby(["Артикул", "Товар"], as_index=False).agg({
-                "Рахунок": lambda x: ", ".join(sorted(set(str(v) for v in x if v))),
                 "Кількість": "sum",
                 "Сума": "sum"
             })
@@ -286,7 +288,8 @@ if uploaded_files:
             for eng, ukr in months.items():
                 current_date_eng = current_date_eng.replace(eng, ukr)
             
-            pdf.cell(0, 10, txt=f"Видаткова накладна згідно рахунків від {current_date_eng} р.", ln=True, align='L')
+            # Змінений заголовок з підстановкою номерів рахунків
+            pdf.cell(0, 10, txt=f"Видаткова накладна № {unique_invoices} від {current_date_eng} р.", ln=True, align='L')
             pdf.ln(5)
             
             pdf.set_font("Roboto", size=10)
@@ -310,8 +313,9 @@ if uploaded_files:
             pdf.multi_cell(0, 6, txt="ТОВ Технології Поля", border=0)
             pdf.ln(8)
             
-            col_widths = [10, 18, 18, 84, 20, 20, 20]
-            headers = ["№", "Артикул", "Рахунок", "Товар", "Кількість", "Ціна", "Сума"]
+            # Оновлені ширини колонок без "Рахунку". Ширину передано на стовпець "Товар"
+            col_widths = [10, 20, 100, 20, 20, 20]
+            headers = ["№", "Артикул", "Товар", "Кількість", "Ціна", "Сума"]
             for i in range(len(headers)):
                 pdf.cell(col_widths[i], 8, txt=headers[i], border=1, align='C')
             pdf.ln()
@@ -319,7 +323,7 @@ if uploaded_files:
             total_invoice_sum = 0
             for idx, row in summary_df.iterrows():
                 item_name = str(row['Товар'])
-                wrapped_name = textwrap.fill(item_name, width=42)
+                wrapped_name = textwrap.fill(item_name, width=50) # Збільшена ширина тексту для ширшої колонки
                 lines_count = len(wrapped_name.split('\n'))
                 
                 line_height_for_multi = 6
@@ -334,16 +338,15 @@ if uploaded_files:
                 
                 pdf.cell(col_widths[0], row_height, txt=str(idx+1), border=1, align='C')
                 pdf.cell(col_widths[1], row_height, txt=str(row['Артикул']), border=1, align='C')
-                pdf.cell(col_widths[2], row_height, txt=str(row['Рахунок']), border=1, align='C')
                 
-                x_after_account = pdf.get_x()
-                pdf.multi_cell(col_widths[3], line_height_for_multi, txt=wrapped_name, border=1, align='L')
+                x_after_articul = pdf.get_x()
+                pdf.multi_cell(col_widths[2], line_height_for_multi, txt=wrapped_name, border=1, align='L')
                 
-                pdf.set_xy(x_after_account + col_widths[3], y_start)
+                pdf.set_xy(x_after_articul + col_widths[2], y_start)
                 
-                pdf.cell(col_widths[4], row_height, txt=f"{int(row['Кількість'])} шт", border=1, align='C')
-                pdf.cell(col_widths[5], row_height, txt=f"{row['Ціна']:.2f}", border=1, align='C')
-                pdf.cell(col_widths[6], row_height, txt=f"{row['Сума']:.2f}", border=1, align='C')
+                pdf.cell(col_widths[3], row_height, txt=f"{int(row['Кількість'])} шт", border=1, align='C')
+                pdf.cell(col_widths[4], row_height, txt=f"{row['Ціна']:.2f}", border=1, align='C')
+                pdf.cell(col_widths[5], row_height, txt=f"{row['Сума']:.2f}", border=1, align='C')
                 
                 pdf.ln(row_height)
                 total_invoice_sum += row['Сума']
