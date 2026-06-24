@@ -9,11 +9,12 @@ from fpdf import FPDF
 from datetime import datetime
 import textwrap
 import pytesseract
-from PIL import ImageEnhance, ImageFilter
+from PIL import ImageEnhance
 
 st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
 
+# --- ФУНКЦІЯ ДЛЯ СУМИ ПРОПИСОМ ---
 def number_to_words_uah(amount):
     def get_words(num, is_female=False):
         units = ["", "один", "два", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
@@ -112,7 +113,6 @@ def parse_line_logic(line, invoice_num):
             
     if first_digit_idx == -1: return None 
         
-    # Відрізаємо текстове сміття до першої цифри
     tokens = raw_tokens[first_digit_idx:]
     if len(tokens) < 3: return None
     
@@ -285,43 +285,40 @@ if uploaded_files:
                     if not page_items and page_text:
                         page_items.extend(parse_text_block(page_text, invoice_num))
 
-                    # ГЛИБОКИЙ OCR ІЗ ПЕРЕБОРОМ ФІЛЬТРІВ
+                    # АЛГОРИТМ "ШРЕДЕР" (Горизонтальна нарізка для ігнорування таблиць)
                     if not page_items:
-                        status_text.text(f"Файл {file.name}: застосування глибокого OCR сканування...")
+                        status_text.text(f"Файл {file.name}: активація алгоритму 'Шредер'...")
                         try:
-                            img_raw = page.to_image(resolution=400).original.convert('L')
+                            img_raw = page.to_image(resolution=300).original.convert('L')
+                            width, height = img_raw.size
                             
-                            # Потовщення тонких ліній + високий контраст
-                            img_thick = img_raw.filter(ImageFilter.BoxBlur(1))
-                            img_thick = ImageEnhance.Contrast(img_thick).enhance(3.0)
+                            # Зчитуємо всю сторінку для захоплення дати
+                            try:
+                                full_img_text = pytesseract.image_to_string(img_raw, lang='ukr', config='--psm 3')
+                                all_text_for_date += full_img_text + "\n"
+                            except: pass
                             
-                            # Просто високий контраст
-                            img_contrast = ImageEnhance.Contrast(img_raw).enhance(2.0)
+                            seen_keys = set()
+                            slice_h = 200
+                            step = 100
                             
-                            images_to_try = [img_raw, img_thick, img_contrast]
-                            ocr_configs = [r'--psm 6', r'--psm 4', r'--psm 3']
-                            
-                            found = False
-                            for img_var in images_to_try:
-                                if found: break
-                                for config in ocr_configs:
-                                    try:
-                                        ocr_text = pytesseract.image_to_string(img_var, lang='ukr+eng', config=config)
-                                    except Exception:
-                                        try:
-                                            ocr_text = pytesseract.image_to_string(img_var, lang='ukr', config=config)
-                                        except Exception:
-                                            ocr_text = pytesseract.image_to_string(img_var, config=config)
-                                        
-                                    extracted_raw_text += f"\n--- ТЕКСТ З OCR ({config}) ---\n" + ocr_text + "\n"
-                                    parsed = parse_text_block(ocr_text, invoice_num)
+                            for y in range(0, height, step):
+                                box = (0, y, width, min(height, y + slice_h))
+                                slice_img = img_raw.crop(box)
+                                slice_img = ImageEnhance.Contrast(slice_img).enhance(1.8)
+                                
+                                try:
+                                    slice_text = pytesseract.image_to_string(slice_img, lang='ukr+eng', config='--psm 6')
+                                    extracted_raw_text += f"\n--- СМУЖКА {y} ---\n" + slice_text
                                     
-                                    if parsed:
-                                        page_items.extend(parsed)
-                                        all_text_for_date += ocr_text + "\n"
-                                        found = True
-                                        break
-                                        
+                                    parsed = parse_text_block(slice_text, invoice_num)
+                                    for item in parsed:
+                                        key = (item["Артикул"], item["Товар"], item["Сума"])
+                                        if key not in seen_keys:
+                                            seen_keys.add(key)
+                                            page_items.append(item)
+                                except Exception:
+                                    pass
                         except Exception as e:
                             pass
             
