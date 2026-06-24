@@ -84,17 +84,29 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-# --- ЛОГІКА РОЗБОРУ РЯДКА ІЗ МАТЕМАТИЧНИМ КОНСЕНСУСОМ ---
+# --- ЛОГІКА РОЗБОРУ РЯДКА З АНТИ-СМІТТЄВИМ ФІЛЬТРОМ ---
 def try_parse_line(line, invoice_num):
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
-    line = line.replace('|', ' ').replace('_', ' ').strip()
+    line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
     line = re.sub(r'\s+', ' ', line)
     
     if not line or "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
         return None
 
+    # Відрізаємо сміття з початку рядка (все до першої цифри)
+    raw_tokens = line.split()
+    start_idx = -1
+    for i, t in enumerate(raw_tokens):
+        if any(char.isdigit() for char in t):
+            start_idx = i
+            break
+            
+    if start_idx == -1:
+        return None 
+        
+    cleaned_tokens = raw_tokens[start_idx:]
+    rest = " ".join(cleaned_tokens)
     art = ""
-    rest = line
     
     match_idx = re.match(r'^(\d{1,4})\s+(.+)$', rest)
     if match_idx:
@@ -105,7 +117,7 @@ def try_parse_line(line, invoice_num):
         art = match_art.group(1)
         rest = match_art.group(2)
         
-    # КРОК 1: Склеюємо числа, якщо сканер замість крапки поставив пробіл (напр. "486 00" -> "486.00")
+    # Склеюємо числа, якщо сканер замість крапки поставив пробіл
     raw_tokens = rest.split()
     tokens = []
     i = 0
@@ -123,7 +135,6 @@ def try_parse_line(line, invoice_num):
     if len(tokens) < 3:
         return None
         
-    # КРОК 2: Збираємо всі цифри з кінця рядка
     rev_tokens = list(reversed(tokens))
     numbers = []
     processed = 0
@@ -166,7 +177,7 @@ def try_parse_line(line, invoice_num):
     if price <= 0 or total <= 0:
         return None
         
-    # КРОК 3: Математичний консенсус (виправляємо 200 шт і 44400 суму)
+    # Математичний консенсус (виправляє загублені крапки, напр. 200 шт замість 2.00)
     if qty > 0:
         if abs((qty / 100) * price - total) < 0.1:
             qty = qty / 100
@@ -181,7 +192,7 @@ def try_parse_line(line, invoice_num):
     else:
         qty = round(total / price, 2)
         
-    # Фінальна перевірка, чи не захопили ми сміття
+    # Контрольна перевірка математики
     if abs(qty * price - total) > 0.5:
         return None
     
@@ -270,20 +281,20 @@ if uploaded_files:
                     if not page_items and page_text:
                         page_items.extend(parse_extracted_text(page_text, invoice_num))
 
-                    # PSM 6 ДОЗВОЛЯЄ ЧИТАТИ РЯДКИ ЧЕРЕЗ ТАБЛИЧНІ ЛІНІЇ
+                    # ВМИКАЄМО ЧИСТИЙ OCR БЕЗ ФІЛЬТРІВ
                     if not page_items:
-                        status_text.text(f"Файл {file.name} потребує глибокого сканування. Вмикаю OCR...")
+                        status_text.text(f"Файл {file.name} потребує оптичного сканування...")
                         try:
-                            img = page.to_image(resolution=300).original.convert('L')
-                            custom_config = r'--psm 6'
+                            # Читаємо просто у високій роздільній здатності
+                            img = page.to_image(resolution=400).original
                             
                             try:
-                                ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config=custom_config)
+                                ocr_text = pytesseract.image_to_string(img, lang='ukr+eng')
                             except Exception:
                                 try:
-                                    ocr_text = pytesseract.image_to_string(img, lang='ukr', config=custom_config)
+                                    ocr_text = pytesseract.image_to_string(img, lang='ukr')
                                 except Exception:
-                                    ocr_text = pytesseract.image_to_string(img, config=custom_config)
+                                    ocr_text = pytesseract.image_to_string(img)
                                 
                             extracted_raw_text += "--- ТЕКСТ З OCR СКАНЕРА ---\n" + ocr_text + "\n"
                             all_text_for_date += ocr_text + "\n"
