@@ -182,13 +182,17 @@ def parse_line_logic(line, invoice_num):
     
     if price <= 0 or total <= 0: return None
     
+    # Виправлена логіка математики: лікуємо тільки якщо є помилка!
     if qty > 0:
-        if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
-        elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
-        elif abs((qty / 100) * price - (total / 100)) < 0.1:
-            qty = qty / 100; total = total / 100
-        elif abs(qty * (price / 100) - (total / 100)) < 0.1:
-            price = price / 100; total = total / 100
+        if abs(qty * price - total) > 0.5: # Тільки якщо оригінальна математика не сходиться
+            if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
+            elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
+            elif abs((qty / 100) * price - (total / 100)) < 0.1:
+                qty = qty / 100; total = total / 100
+            elif abs(qty * (price / 100) - (total / 100)) < 0.1:
+                price = price / 100; total = total / 100
+    else:
+        qty = round(total / price, 2)
             
     if qty > 0 and abs(qty * price - total) <= 0.5:
         processed = temp_processed
@@ -306,46 +310,18 @@ if uploaded_files:
                     if not page_items and page_text:
                         page_items.extend(parse_text_block(page_text, invoice_num))
 
-                    # 2. ПРОГРАМНЕ ЗНИЩЕННЯ СІТКИ ТА OCR-СКАНУВАННЯ (ідеально для файлів 437898)
+                    # 2. Швидкий OCR як запасний варіант
                     if not page_items:
-                        status_text.text(f"Файл {file.name}: очищення сітки таблиці та сканування...")
-                        try:
-                            # Фільтр: ігнорувати всі лінії та прямокутники (grid)
-                            def remove_tables(obj):
-                                return obj.get("object_type") not in ["line", "rect"]
-                            
-                            clean_page = page.filter(remove_tables)
-                            img_clean = clean_page.to_image(resolution=400).original.convert('L')
-                            
-                            # psm 6: зчитувати рівними рядками (оскільки таблиці вже немає)
-                            ocr_text = pytesseract.image_to_string(img_clean, lang='ukr+eng', config='--psm 6')
-                            if not ocr_text.strip():
-                                ocr_text = pytesseract.image_to_string(img_clean, lang='ukr', config='--psm 6')
-                                
-                            extracted_raw_text += "\n--- ТЕКСТ З OCR (БЕЗ СІТКИ, psm 6) ---\n" + ocr_text + "\n"
-                            
-                            parsed = parse_text_block(ocr_text, invoice_num)
-                            if parsed:
-                                page_items.extend(parsed)
-                                all_text_for_date += ocr_text + "\n"
-                            else:
-                                # Запасний варіант psm 4
-                                ocr_text2 = pytesseract.image_to_string(img_clean, lang='ukr+eng', config='--psm 4')
-                                extracted_raw_text += "\n--- ТЕКСТ З OCR (БЕЗ СІТКИ, psm 4) ---\n" + ocr_text2 + "\n"
-                                parsed2 = parse_text_block(ocr_text2, invoice_num)
-                                if parsed2:
-                                    page_items.extend(parsed2)
-                                    all_text_for_date += ocr_text2 + "\n"
-                        except Exception as e:
-                            pass
-                            
-                    # 3. Якщо все ще пусто (це суцільне фото-скан), скануємо як є
-                    if not page_items:
-                        status_text.text(f"Файл {file.name}: глибоке фото-сканування...")
+                        status_text.text(f"Файл {file.name}: активація оптичного сканування...")
                         try:
                             img_raw = page.to_image(resolution=400).original.convert('L')
-                            ocr_text = pytesseract.image_to_string(img_raw, lang='ukr+eng', config='--psm 4')
-                            extracted_raw_text += "\n--- ТЕКСТ З ФОТО-OCR (psm 4) ---\n" + ocr_text + "\n"
+                            img = img_raw.point(lambda x: 0 if x < 200 else 255, '1')
+                            
+                            ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config='--psm 6')
+                            if not ocr_text.strip():
+                                ocr_text = pytesseract.image_to_string(img, lang='ukr', config='--psm 6')
+                                
+                            extracted_raw_text += "\n--- ТЕКСТ З OCR ---\n" + ocr_text + "\n"
                             
                             parsed = parse_text_block(ocr_text, invoice_num)
                             if parsed:
