@@ -84,44 +84,55 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-# --- НОВИЙ АБСОЛЮТНИЙ ПАРСЕР РЯДКІВ (З ІГНОРУВАННЯМ СМІТТЯ) ---
+# --- ПАРСЕР ЗІ СТОП-СЛОВАМИ (БЛОКУВАННЯ ШАПКИ ТА ПІДВАЛУ) ---
 def parse_text_block(text, invoice_num):
     items = []
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
+    
+    # Список слів-маркерів, які гарантовано означають, що це не товар
+    stop_phrases = [
+        "постачальник", "покупець", "адреса:", "єдрпоу", "іпн", "рахунок-фактура",
+        "хмельницька", "нетішин", "енергетиків", "приватбанк", "тел.", "+380",
+        "гуменюк", "копійок", "отримав(ла)", "від виконавця", "найменувань", 
+        "разом:", "сума без пдв", "технології поля",
+        "січня", "лютого", "березня", "квітня", "травня", "червня", 
+        "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
+        "р/р", "p/p", "ua393"
+    ]
     
     for line in text.split('\n'):
         line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
         line = re.sub(r'\s+', ' ', line)
         
-        if not line or "разом" in line.lower() or "сума" in line.lower() or "всього" in line.lower():
+        if not line:
+            continue
+            
+        # Якщо в рядку є хоч одне стоп-слово - одразу викидаємо його
+        line_lower = line.lower()
+        if any(phrase in line_lower for phrase in stop_phrases):
             continue
             
         tokens = line.split()
         
-        # Знаходимо всі слова, які містять хоча б одну цифру
         tokens_with_digits = [i for i, t in enumerate(tokens) if any(c.isdigit() for c in t)]
-        if len(tokens_with_digits) < 3: # Мінімум: Артикул, Ціна, Сума
+        if len(tokens_with_digits) < 3: 
             continue
             
         first_digit_idx = tokens_with_digits[0]
         second_digit_idx = tokens_with_digits[1]
         
         art = ""
-        # Визначаємо, чи перша цифра - це порядковий номер (1, 2, 3...) чи сам Артикул
         if re.match(r'^\d{1,3}$', tokens[first_digit_idx].replace('.', '')):
-            # Якщо перша цифра коротка (номер), перевіряємо, чи є ще цифри до ціни/суми
             if second_digit_idx < len(tokens) - 2:
-                art = tokens[second_digit_idx] # Беремо другу цифру як Артикул
-                tokens = tokens[second_digit_idx + 1 :] # Відрізаємо все до артикулу (вкл. сміття)
+                art = tokens[second_digit_idx]
+                tokens = tokens[second_digit_idx + 1 :]
             else:
-                art = tokens[first_digit_idx] # Це і є Артикул
+                art = tokens[first_digit_idx]
                 tokens = tokens[first_digit_idx + 1 :]
         else:
-            # Якщо перша цифра довга або з буквами (ТПUT-123) - це точно Артикул
             art = tokens[first_digit_idx]
             tokens = tokens[first_digit_idx + 1 :]
             
-        # Склеюємо розірвані сканером копійки (напр. "222 00" -> "222.00")
         new_tokens = []
         i = 0
         while i < len(tokens):
@@ -137,7 +148,6 @@ def parse_text_block(text, invoice_num):
             
         if len(new_tokens) < 2: continue
         
-        # Читаємо числа з кінця рядка
         rev_tokens = list(reversed(new_tokens))
         numbers = []
         processed = 0
@@ -175,7 +185,6 @@ def parse_text_block(text, invoice_num):
         
         if price <= 0 or total <= 0: continue
         
-        # Математична автокорекція (виправляє баг OCR з "200 шт" і "44400 сума")
         if qty > 0:
             if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
             elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
@@ -230,7 +239,6 @@ if uploaded_files:
                     all_text_for_date += page_text + "\n"
                     extracted_raw_text += "--- ТЕКСТ СТОРІНКИ ---\n" + page_text + "\n"
                     
-                    # 1. Пробуємо ідеальну таблицю
                     table = page.extract_table({"vertical_strategy": "lines", "horizontal_strategy": "lines"})
                     if not table:
                         table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
@@ -244,20 +252,15 @@ if uploaded_files:
                         extracted_raw_text += "--- ТАБЛИЦЯ ---\n" + full_table_text + "\n"
                         page_items.extend(parse_text_block(full_table_text, invoice_num))
                     
-                    # 2. Якщо таблиця не дала товарів, пробуємо текст
                     if not page_items and page_text:
                         page_items.extend(parse_text_block(page_text, invoice_num))
 
-                    # 3. Якщо і це не вийшло (це векторний малюнок), застосовуємо БРОНЕБІЙНИЙ OCR
                     if not page_items:
                         status_text.text(f"Файл {file.name} - складний малюнок. Вмикаю глибокий OCR сканер...")
                         try:
-                            # Захоплюємо чорно-біле фото у високій якості
                             img = page.to_image(resolution=400).original.convert('L')
-                            # Відсікаємо всі тіні і сірі лінії таблиць (робимо жорсткий трафарет)
                             img = img.point(lambda x: 0 if x < 200 else 255, '1')
                             
-                            # psm 6 - читати просто рядками (ігнорувати колонки)
                             custom_config = r'--psm 6'
                             
                             try:
@@ -275,7 +278,7 @@ if uploaded_files:
                         except Exception as e:
                             pass
             
-            # --- ПОШУК ДАТИ РАХУНКУ ---
+            # --- РОЗШИРЕНИЙ ПОШУК ДАТИ РАХУНКУ ---
             date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*(?:[рpРP]\.?)?)', all_text_for_date, re.IGNORECASE)
             if date_match:
                 clean_date = re.sub(r'\s+', ' ', date_match.group(1)).strip()
