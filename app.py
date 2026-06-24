@@ -13,7 +13,6 @@ import pytesseract
 st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
 
-# --- ФУНКЦІЯ ДЛЯ СУМИ ПРОПИСОМ ---
 def number_to_words_uah(amount):
     def get_words(num, is_female=False):
         units = ["", "один", "два", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
@@ -74,7 +73,6 @@ def number_to_words_uah(amount):
     res = re.sub(' +', ' ', res).capitalize()
     return f"{res} {kop:02d} копійок"
 
-# Автоматичне завантаження шрифтів
 @st.cache_resource
 def get_fonts():
     reg_path = "Roboto-Regular.ttf"
@@ -85,7 +83,6 @@ def get_fonts():
         urllib.request.urlretrieve("https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Bold.ttf", bold_path)
     return reg_path, bold_path
 
-# --- НОВИЙ МАТЕМАТИЧНИЙ ПАРСЕР ---
 def parse_extracted_text(text, invoice_num):
     items = []
     UNITS = {'шт', 'шт.', 'кг', 'л', 'м', 'уп', 'уп.', 'штуки', 'штук'}
@@ -100,12 +97,10 @@ def parse_extracted_text(text, invoice_num):
         art = ""
         rest = line
         
-        # Видаляємо порядковий номер на початку, якщо він є
         match_idx = re.match(r'^(\d{1,4})\s+(.+)$', rest)
         if match_idx:
             rest = match_idx.group(2)
         
-        # Шукаємо Артикул (будь-які букви/цифри/дефіси, але ОБОВ'ЯЗКОВО має бути хоч одна цифра)
         match_art = re.match(r'^([A-Za-zА-Яа-яІіЇїЄє0-9/-]*\d[A-Za-zА-Яа-яІіЇїЄє0-9/-]*)\s+(.+)$', rest)
         if match_art:
             art = match_art.group(1)
@@ -115,7 +110,6 @@ def parse_extracted_text(text, invoice_num):
         if len(tokens) < 3:
             continue
             
-        # Завжди беремо два останні числа як Ціну та Суму
         try:
             total = float(tokens[-1].replace(',', '.').replace('O', '0'))
             price = float(tokens[-2].replace(',', '.').replace('O', '0'))
@@ -125,14 +119,11 @@ def parse_extracted_text(text, invoice_num):
         if price <= 0 or total <= 0:
             continue
             
-        # Вираховуємо кількість математично
         math_qty = round(total / price, 2)
         qty = math_qty
         
-        # Все, що залишилося - це назва товару (плюс, можливо, розпізнана кількість)
         name_tokens = tokens[:-2]
         
-        # Обережно відрізаємо кількість та одиниці виміру з кінця назви, якщо вони там є
         if name_tokens:
             last_tok = name_tokens[-1].lower()
             if last_tok in UNITS:
@@ -140,7 +131,6 @@ def parse_extracted_text(text, invoice_num):
                 if name_tokens:
                     try:
                         parsed_q = float(name_tokens[-1].replace(',', '.').replace('O', '0'))
-                        # Відрізаємо цифру тільки якщо вона збігається з математикою
                         if abs(parsed_q - math_qty) <= 0.05:
                             name_tokens.pop()
                     except:
@@ -180,6 +170,7 @@ if uploaded_files:
     if st.button("Сформувати 1 видаткову"):
         all_items = []
         debug_logs = {}
+        invoice_dates = set()
         
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -196,7 +187,6 @@ if uploaded_files:
 
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf_file:
                 for page in pdf_file.pages:
-                    # Витягуємо таблицю і склеюємо її в один рядок для нашого парсера
                     table = page.extract_table({"vertical_strategy": "lines", "horizontal_strategy": "lines"})
                     if not table:
                         table = page.extract_table({"vertical_strategy": "text", "horizontal_strategy": "lines"})
@@ -210,14 +200,12 @@ if uploaded_files:
                         extracted_raw_text += full_text
                         page_items.extend(parse_extracted_text(full_text, invoice_num))
                     
-                    # Якщо таблиці немає, беремо сирий текст
                     if not page_items:
                         text = page.extract_text()
                         if text:
                             extracted_raw_text += text + "\n"
                             page_items.extend(parse_extracted_text(text, invoice_num))
 
-                    # Якщо і це не допомогло, запускаємо OCR
                     if not page_items:
                         status_text.text(f"Файл {file.name} - це фотографія. Запускаю OCR сканер...")
                         try:
@@ -235,6 +223,16 @@ if uploaded_files:
                         except Exception as e:
                             pass
             
+            # --- ПОШУК ДАТИ РАХУНКУ ---
+            date_match = re.search(r'(\d{1,2}\s+(?:січня|лютого|березня|квітня|травня|червня|липня|серпня|вересня|жовтня|листопада|грудня)\s+\d{4}\s*[рpРP]\.?)', extracted_raw_text, re.IGNORECASE)
+            if date_match:
+                clean_date = re.sub(r'\s+', ' ', date_match.group(1)).strip()
+                clean_date = clean_date.replace('p', 'р').replace('P', 'Р')
+                if not clean_date.endswith('.'):
+                    clean_date += '.'
+                invoice_dates.add(clean_date)
+            # --------------------------
+
             debug_logs[file.name] = extracted_raw_text
             
             if page_items:
@@ -249,7 +247,6 @@ if uploaded_files:
         if all_items:
             df = pd.DataFrame(all_items)
             
-            # Генеруємо назву файлу з номерів
             unique_invoices_list = sorted(df["Рахунок"].unique().astype(str))
             unique_invoices_str = ", ".join(unique_invoices_list)
             file_name_out = f"Vydatkova_{'_'.join(unique_invoices_list)}.pdf"
@@ -260,6 +257,16 @@ if uploaded_files:
             })
             summary_df["Ціна"] = (summary_df["Сума"] / summary_df["Кількість"]).round(2)
             
+            # Визначаємо фінальну дату для шапки
+            if invoice_dates:
+                final_date_str = ", ".join(sorted(list(invoice_dates)))
+            else:
+                months = {"January": "січня", "February": "лютого", "March": "березня", "April": "квітня", "May": "травня", "June": "червня", "July": "липня", "August": "серпня", "September": "вересня", "October": "жовтня", "November": "листопада", "December": "грудня"}
+                final_date_str = datetime.now().strftime("%d %B %Y")
+                for eng, ukr in months.items():
+                    final_date_str = final_date_str.replace(eng, ukr)
+                final_date_str += " р."
+
             # --- ГЕНЕРАЦІЯ PDF ---
             pdf = FPDF()
             pdf.add_page()
@@ -269,12 +276,8 @@ if uploaded_files:
             pdf.add_font("Roboto", "B", font_bold, uni=True)
             
             pdf.set_font("Roboto", size=14)
-            months = {"January": "січня", "February": "лютого", "March": "березня", "April": "квітня", "May": "травня", "June": "червня", "July": "липня", "August": "серпня", "September": "вересня", "October": "жовтня", "November": "листопада", "December": "грудня"}
-            current_date_eng = datetime.now().strftime("%d %B %Y")
-            for eng, ukr in months.items():
-                current_date_eng = current_date_eng.replace(eng, ukr)
             
-            pdf.cell(0, 10, txt=f"Видаткова накладна № {unique_invoices_str} від {current_date_eng} р.", ln=True, align='L')
+            pdf.cell(0, 10, txt=f"Видаткова накладна № {unique_invoices_str} від {final_date_str}", ln=True, align='L')
             pdf.ln(5)
             
             pdf.set_font("Roboto", size=10)
@@ -306,7 +309,6 @@ if uploaded_files:
             
             total_invoice_sum = 0
             for idx, row in summary_df.iterrows():
-                # Жорстка зачистка артикулу від прихованих ентерів та скорочення, якщо він гігантський
                 clean_articul = re.sub(r'\s+', ' ', str(row['Артикул'])).strip()
                 if len(clean_articul) > 10:
                     clean_articul = clean_articul[:9] + "…"
@@ -317,7 +319,6 @@ if uploaded_files:
                 
                 row_height = max(8, lines_count * 5 + 2)
                 
-                # Захист від розриву таблиці в кінці сторінки
                 if pdf.get_y() + row_height > 270:
                     pdf.add_page()
                     for i in range(len(headers)):
@@ -327,7 +328,6 @@ if uploaded_files:
                 x = pdf.get_x()
                 y = pdf.get_y()
                 
-                # Ручне малювання бездоганної сітки (гарантує відсутність накладання ліній)
                 pdf.rect(x, y, col_widths[0], row_height)
                 pdf.rect(x + sum(col_widths[:1]), y, col_widths[1], row_height)
                 pdf.rect(x + sum(col_widths[:2]), y, col_widths[2], row_height)
@@ -337,7 +337,6 @@ if uploaded_files:
                 
                 y_center = y + (row_height - 6) / 2
                 
-                # Вписування тексту у сітку без рамок (border=0)
                 pdf.set_xy(x, y_center)
                 pdf.cell(col_widths[0], 6, txt=str(idx+1), border=0, align='C')
                 
