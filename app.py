@@ -9,10 +9,12 @@ from fpdf import FPDF
 from datetime import datetime
 import textwrap
 import pytesseract
+from PIL import ImageEnhance
 
 st.set_page_config(layout="wide")
 st.title("Генератор зведеної видаткової (PDF)")
 
+# --- ФУНКЦІЯ ДЛЯ СУМИ ПРОПИСОМ ---
 def number_to_words_uah(amount):
     def get_words(num, is_female=False):
         units = ["", "один", "два", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
@@ -92,17 +94,20 @@ def parse_line_logic(line, invoice_num):
         "разом:", "сума без пдв", "технології поля", "ферм є",
         "січня", "лютого", "березня", "квітня", "травня", "червня", 
         "липня", "серпня", "вересня", "жовтня", "листопада", "грудня",
-        "р/р", "p/p", "ua393"
+        "р/р", "p/p", "ua393", "одна", "дві", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять", "десять"
     ]
     
-    line = line.replace('|', ' ').replace('_', ' ').replace('—', ' ').strip()
-    line = re.sub(r'\s+', ' ', line)
+    # Жорстка очистка від артефактів OCR
+    line = re.sub(r'[{}[\]|=_—]', ' ', line)
+    line = line.replace('wt', 'шт').replace('wT', 'шт').replace('wт', 'шт').replace('ШТ', 'шт')
+    line = re.sub(r'\s+', ' ', line).strip()
     
     if not line: return None
     if any(phrase in line.lower() for phrase in stop_phrases): return None
         
     raw_tokens = line.split()
     
+    # Відсікаємо сміття до першої цифри
     first_digit_idx = -1
     for i, t in enumerate(raw_tokens):
         if any(c.isdigit() for c in t):
@@ -182,10 +187,11 @@ def parse_line_logic(line, invoice_num):
     
     if price <= 0 or total <= 0: return None
     
-    # Виправлена логіка математики: лікуємо тільки якщо є помилка!
+    # Бронебійна математика (тільки при помилці)
     if qty > 0:
-        if abs(qty * price - total) > 0.5: # Тільки якщо оригінальна математика не сходиться
+        if abs(qty * price - total) > 0.5:
             if abs((qty / 100) * price - total) < 0.1: qty = qty / 100
+            elif abs(qty * (price / 100) - total) < 0.1: price = price / 100
             elif abs(qty * price - (total / 100)) < 0.1: total = total / 100
             elif abs((qty / 100) * price - (total / 100)) < 0.1:
                 qty = qty / 100; total = total / 100
@@ -194,29 +200,13 @@ def parse_line_logic(line, invoice_num):
     else:
         qty = round(total / price, 2)
             
+    # Контрольна перевірка
+    if abs(qty * price - total) > 0.5: return None
+    
     if qty > 0 and abs(qty * price - total) <= 0.5:
         processed = temp_processed
     else:
-        qty = round(total / price, 2)
-        processed = 0
-        nums_found = 0
-        for tok in rev_tokens:
-            if tok.lower() in UNITS:
-                processed += 1
-                continue
-            m = re.match(r'^([\d.]+)([а-яА-Яa-zA-Z.]+)$', tok)
-            if m and m.group(2).lower() in UNITS:
-                nums_found += 1
-                processed += 1
-            elif re.match(r'^[\d.]+$', tok) and any(c.isdigit() for c in tok) and tok.count('.') <= 1:
-                nums_found += 1
-                processed += 1
-            else:
-                break
-            if nums_found == 2:
-                break
-                
-    if abs(qty * price - total) > 0.5: return None
+        processed = 0 
     
     name_tokens = new_tokens[:-processed] if processed > 0 else new_tokens
     name = " ".join(name_tokens).strip()
@@ -239,8 +229,8 @@ def parse_text_block(text, invoice_num):
     i = 0
     while i < len(raw_lines):
         line = raw_lines[i]
-        item = parse_line_logic(line, invoice_num)
         
+        item = parse_line_logic(line, invoice_num)
         if item:
             items.append(item)
             i += 1
@@ -307,19 +297,25 @@ if uploaded_files:
                         extracted_raw_text += "--- ТАБЛИЦЯ ---\n" + full_table_text + "\n"
                         page_items.extend(parse_text_block(full_table_text, invoice_num))
                     
+                    # 2. Якщо таблиця не дала товарів, пробуємо текст
                     if not page_items and page_text:
                         page_items.extend(parse_text_block(page_text, invoice_num))
 
-                    # 2. Швидкий OCR як запасний варіант
+                    # 3. Якщо і це не вийшло, застосовуємо БРОНЕБІЙНИЙ OCR
                     if not page_items:
-                        status_text.text(f"Файл {file.name}: активація оптичного сканування...")
+                        status_text.text(f"Файл {file.name} - оптичне сканування...")
                         try:
-                            img_raw = page.to_image(resolution=400).original.convert('L')
-                            img = img_raw.point(lambda x: 0 if x < 200 else 255, '1')
+                            # Видаляємо лінії, щоб текст висів у повітрі
+                            def remove_tables(obj):
+                                return obj.get("object_type") not in ["line", "rect"]
                             
-                            ocr_text = pytesseract.image_to_string(img, lang='ukr+eng', config='--psm 6')
+                            clean_page = page.filter(remove_tables)
+                            img_clean = clean_page.to_image(resolution=300).original.convert('L')
+                            img_clean = ImageEnhance.Contrast(img_clean).enhance(2.0)
+                            
+                            ocr_text = pytesseract.image_to_string(img_clean, lang='ukr+eng', config='--psm 6')
                             if not ocr_text.strip():
-                                ocr_text = pytesseract.image_to_string(img, lang='ukr', config='--psm 6')
+                                ocr_text = pytesseract.image_to_string(img_clean, lang='ukr', config='--psm 6')
                                 
                             extracted_raw_text += "\n--- ТЕКСТ З OCR ---\n" + ocr_text + "\n"
                             
@@ -327,6 +323,13 @@ if uploaded_files:
                             if parsed:
                                 page_items.extend(parsed)
                                 all_text_for_date += ocr_text + "\n"
+                            else:
+                                ocr_text2 = pytesseract.image_to_string(img_clean, lang='ukr+eng', config='--psm 4')
+                                extracted_raw_text += "\n--- ТЕКСТ З OCR (psm 4) ---\n" + ocr_text2 + "\n"
+                                parsed2 = parse_text_block(ocr_text2, invoice_num)
+                                if parsed2:
+                                    page_items.extend(parsed2)
+                                    all_text_for_date += ocr_text2 + "\n"
                         except Exception as e:
                             pass
             
